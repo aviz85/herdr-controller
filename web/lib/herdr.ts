@@ -53,6 +53,10 @@ export const herdr = {
   agents: () => req<{ agents: Agent[]; count: number }>("/agents"),
   read: (target: string, lines = 200) =>
     req<string>(`/agents/${encodeURIComponent(target)}/read?lines=${lines}`),
+  bubble: (target: string) =>
+    req<{ target: string; message: string }>(
+      `/agents/${encodeURIComponent(target)}/bubble`,
+    ),
   send: (target: string, text: string, enter: boolean) =>
     req(`/agents/${encodeURIComponent(target)}/send`, {
       method: "POST",

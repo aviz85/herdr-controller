@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# scratch / generated
+tmp-*.mp3
+tmp-*.wav

@@ -193,6 +193,52 @@ async def wait_agent(target: str, body: WaitStatus):
     return result
 
 
+_UI_NOISE = (
+    "⏵", "❯", "bypass permissions", "new task?", "/clear", "/rc",
+    "shift+tab", "for agents", "esc to interrupt", "ctrl+",
+)
+
+
+def _extract_bubble(text: str) -> str:
+    """Heuristically pull an agent's last human-readable message from a rendered
+    terminal transcript, for use as a speech bubble."""
+    lines = text.splitlines()
+    # Prefer the "※ recap:" summary line if the agent emitted one.
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("※ recap:"):
+            msg = s[len("※ recap:"):].strip()
+            # stitch the (indented) continuation line if present
+            if i + 1 < len(lines) and lines[i + 1].strip() and not lines[i + 1].startswith("─"):
+                msg += " " + lines[i + 1].strip()
+            return msg
+    # Otherwise: last substantial line that isn't box-drawing or TUI chrome.
+    for ln in reversed(lines):
+        s = ln.strip().strip("─").strip()
+        if not s or len(s) < 4:
+            continue
+        low = s.lower()
+        if set(s) <= {"─", "═", "—", "·", " "}:
+            continue
+        if any(n in low for n in _UI_NOISE):
+            continue
+        return s
+    return ""
+
+
+@app.get("/agents/{target}/bubble", tags=["agents"])
+async def agent_bubble(target: str, max_chars: int = Query(280, ge=20, le=2000)):
+    """Best-effort 'last message' for a done agent — for office speech bubbles."""
+    result = await _wrap(
+        run_herdr(["agent", "read", target, "--source", "recent-unwrapped", "--lines", "60"])
+    )
+    text = result.get("read", {}).get("text", "")
+    msg = _extract_bubble(text)
+    if len(msg) > max_chars:
+        msg = msg[: max_chars - 1].rstrip() + "…"
+    return {"target": target, "message": msg}
+
+
 @app.get("/agents/{target}/explain", tags=["agents"])
 async def explain_agent(target: str):
     """herdr's structured explanation of an agent's current state."""
