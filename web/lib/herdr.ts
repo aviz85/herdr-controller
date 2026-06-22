@@ -66,6 +66,9 @@ export const herdr = {
     req(`/agents/${encodeURIComponent(target)}/focus`, { method: "POST" }),
   start: (body: Record<string, unknown>) =>
     req("/agents/start", { method: "POST", body: JSON.stringify(body) }),
+  // Closes the agent's pane in herdr — i.e. actually kills the agent.
+  kill: (paneId: string) =>
+    req(`/panes/${encodeURIComponent(paneId)}`, { method: "DELETE" }),
   streamUrl: () => `${API_BASE}/agents/stream`,
 };
 
