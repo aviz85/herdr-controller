@@ -6,657 +6,2488 @@ import { type Agent, type AgentStatus, herdr, repoName } from "@/lib/herdr";
 import { useAgents } from "@/components/use-agents";
 import { makeLabelTexture, isHebrew } from "@/components/office/text-texture";
 
-const STATUS_COLOR: Record<AgentStatus, number> = {
-  working: 0x3b82f6,
-  idle: 0x71717a,
-  blocked: 0xf59e0b,
-  done: 0x10b981,
-  unknown: 0x3f3f46,
-};
-const STATUS_ICON: Record<AgentStatus, string> = {
-  working: "⌨️",
-  idle: "💤",
-  blocked: "⚠️",
-  done: "✅",
-  unknown: "·",
+// ─────────────────────────────────────────────────────────────────────────────
+// herdr 3D Office FPS — single-file scene.
+// Each live agent = one cubicle keyed by workspace_id with a stable slot.
+// Pointer-lock FPS: WASD + jump/sprint/crouch, hitscan gun, 3 shots kill an
+// agent (real herdr.kill), the focused controller agent is shield-protected.
+// All textures Canvas2D, all audio WebAudio synth. No addons, no external assets.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const STATUS: Record<AgentStatus, { c: number; i: number }> = {
+  working: { c: 0x33ddff, i: 2.2 },
+  idle: { c: 0xffaa44, i: 0.5 },
+  blocked: { c: 0xff3322, i: 1.6 },
+  done: { c: 0x44ff88, i: 1.4 },
+  unknown: { c: 0x8899aa, i: 0.7 },
 };
 
-const COLS = 4;
-const CELL = 7.5;
-const MAX_HP = 3;
+const STATUS_HEX: Record<AgentStatus, string> = {
+  working: "#33ddff",
+  idle: "#ffaa44",
+  blocked: "#ff3322",
+  done: "#44ff88",
+  unknown: "#8899aa",
+};
 
-interface Office {
+// The backend produces agent_status from untyped CLI JSON with no runtime
+// validation, so the AgentStatus type is a compile-time fiction. Normalize any
+// out-of-union / missing value to "unknown" before indexing STATUS/STATUS_HEX.
+const safeStatus = (s: AgentStatus): AgentStatus =>
+  s in STATUS ? s : "unknown";
+
+const COLS = 5;
+const MAX_DESKS = 20;
+const CELL = 5.2;
+const ROW_GAP = 6.4;
+const EYE = 1.62;
+const CROUCH_EYE = 1.05;
+const MAG_SIZE = 12;
+const RESERVE_MAX = 96;
+const HITS_TO_KILL = 3;
+
+interface HudState {
+  health: number;
+  stamina: number;
+  ammo: number;
+  reserve: number;
+  reloading: boolean;
+  score: number;
+  combo: number;
+  killfeed: { id: number; text: string; color: string }[];
+  objective: string;
+  fps: number;
+  hitmarker: number;
+  headshot: boolean;
+  damageFlash: number;
+  killFlash: number;
+  shieldHint: number;
+  paused: boolean;
+  locked: boolean;
+  connected: boolean;
+  error: string | null;
+  highScore: number;
+  spread: number;
+}
+
+interface Rig {
   group: THREE.Group;
-  character: THREE.Group;
-  leftArm: THREE.Object3D;
-  rightArm: THREE.Object3D;
-  head: THREE.Object3D;
-  body: THREE.Object3D;
-  screenMat: THREE.MeshStandardMaterial;
-  bodyMat: THREE.MeshStandardMaterial;
-  chair: THREE.Object3D;
-  hitbox: THREE.Mesh;
-  healthBar: THREE.Sprite;
-  signSprite: THREE.Sprite | null;
-  iconSprite: THREE.Sprite;
-  bubbleSprite: THREE.Sprite | null;
-  baseX: number;
-  baseZ: number;
+  monitorMat: THREE.MeshStandardMaterial;
+  light: THREE.PointLight;
+  bloom: THREE.Sprite;
+  head: THREE.Mesh;
+  body: THREE.Mesh;
+  torso: THREE.Mesh;
+  armL: THREE.Mesh;
+  armR: THREE.Mesh;
+  chair: THREE.Group;
+  sign?: THREE.Sprite;
+  signTex?: THREE.CanvasTexture;
+  bubble?: THREE.Sprite;
+  bubbleTex?: THREE.CanvasTexture;
   status: AgentStatus;
-  present: boolean;
-  focused: boolean;
+  targetColor: THREE.Color;
+  targetIntensity: number;
   paneId: string;
-  label: string;
-  hp: number;
-  dying: number; // 0 = alive, else timestamp progress
-  hitFlash: number;
-  bubbleText: string | null;
-  bubbleFetchedFor: string | null;
-  phase: number;
-}
-
-function makeSprite(tex: THREE.Texture): THREE.Sprite {
-  return new THREE.Sprite(
-    new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }),
-  );
-}
-
-function emojiTexture(emoji: string): THREE.CanvasTexture {
-  const c = document.createElement("canvas");
-  c.width = c.height = 128;
-  const ctx = c.getContext("2d")!;
-  ctx.font = "96px serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(emoji, 64, 72);
-  return new THREE.CanvasTexture(c);
-}
-
-function healthTexture(hp: number, max: number, shield: boolean): THREE.CanvasTexture {
-  const w = 200, h = 36;
-  const c = document.createElement("canvas");
-  c.width = w; c.height = h;
-  const ctx = c.getContext("2d")!;
-  ctx.fillStyle = "rgba(0,0,0,0.55)";
-  ctx.fillRect(0, 0, w, h);
-  const seg = (w - 8) / max;
-  for (let i = 0; i < max; i++) {
-    ctx.fillStyle = shield ? "#38bdf8" : i < hp ? "#22c55e" : "#3f3f46";
-    ctx.fillRect(4 + i * seg + 2, 6, seg - 4, h - 12);
-  }
-  return new THREE.CanvasTexture(c);
+  focused: boolean;
+  seed: number;
+  slot: number;
+  dead: boolean;
+  deathT: number;
+  signText: string;
 }
 
 export function OfficeScene() {
-  const mountRef = useRef<HTMLDivElement>(null);
-  const { agents, connected } = useAgents();
+  const { agents, connected, error } = useAgents();
+  const mountRef = useRef<HTMLDivElement | null>(null);
   const agentsRef = useRef<Agent[]>([]);
-  const officesRef = useRef<Map<string, Office>>(new Map());
-  const hitboxesRef = useRef<THREE.Mesh[]>([]);
-  const slotRef = useRef<Map<string, number>>(new Map());
-  const sceneRef = useRef<THREE.Scene | null>(null);
-  const [kills, setKills] = useState(0);
-  const [locked, setLocked] = useState(false);
-  const [hint, setHint] = useState<string | null>(null);
+  agentsRef.current = agents;
+
+  const [hud, setHud] = useState<HudState>({
+    health: 100,
+    stamina: 100,
+    ammo: MAG_SIZE,
+    reserve: RESERVE_MAX,
+    reloading: false,
+    score: 0,
+    combo: 1,
+    killfeed: [],
+    objective: "Eliminate idle/blocked agents — protect the controller",
+    fps: 0,
+    hitmarker: 0,
+    headshot: false,
+    damageFlash: 0,
+    killFlash: 0,
+    shieldHint: 0,
+    paused: false,
+    locked: false,
+    connected: false,
+    error: null,
+    highScore: 0,
+    spread: 6,
+  });
 
   useEffect(() => {
-    agentsRef.current = agents;
-  }, [agents]);
+    setHud((h) => ({ ...h, connected, error }));
+  }, [connected, error]);
 
   useEffect(() => {
-    const mount = mountRef.current!;
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b0b12);
-    scene.fog = new THREE.Fog(0x0b0b12, 30, 75);
-    sceneRef.current = scene;
+    const mount = mountRef.current;
+    if (!mount) return;
 
-    const camera = new THREE.PerspectiveCamera(
-      72, mount.clientWidth / mount.clientHeight, 0.1, 300,
-    );
-    camera.position.set(CELL * (COLS - 1) * 0.5, 1.7, (Math.ceil(8 / COLS)) * CELL + 6);
+    // ── HUD push throttle ────────────────────────────────────────────────────
+    let hudDirty = true;
+    const hudData: HudState = {
+      health: 100,
+      stamina: 100,
+      ammo: MAG_SIZE,
+      reserve: RESERVE_MAX,
+      reloading: false,
+      score: 0,
+      combo: 1,
+      killfeed: [],
+      objective: "Eliminate idle/blocked agents — protect the controller",
+      fps: 0,
+      hitmarker: 0,
+      headshot: false,
+      damageFlash: 0,
+      killFlash: 0,
+      shieldHint: 0,
+      paused: false,
+      locked: false,
+      connected: false,
+      error: null,
+      highScore: 0,
+      spread: 6,
+    };
+    const pushHud = (patch: Partial<HudState>) => {
+      Object.assign(hudData, patch);
+      hudDirty = true;
+    };
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    // ── THREE bootstrap ──────────────────────────────────────────────────────
+    THREE.ColorManagement.enabled = true;
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      powerPreference: "high-performance",
+    });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(mount.clientWidth, mount.clientHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     mount.appendChild(renderer.domElement);
 
-    scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x202028, 0.75));
-    const key = new THREE.DirectionalLight(0xffffff, 1.1);
-    key.position.set(14, 24, 12);
-    key.castShadow = true;
-    key.shadow.mapSize.set(2048, 2048);
-    Object.assign(key.shadow.camera, { left: -50, right: 50, top: 50, bottom: -50 });
-    scene.add(key);
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x0a0a18, 0.018);
 
-    const floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(300, 300),
-      new THREE.MeshStandardMaterial({ color: 0x16161f, roughness: 0.95 }),
+    const camera = new THREE.PerspectiveCamera(
+      72,
+      mount.clientWidth / mount.clientHeight,
+      0.05,
+      400,
     );
+
+    const disposables: { dispose: () => void }[] = [];
+    const track = <T extends { dispose: () => void }>(o: T): T => {
+      disposables.push(o);
+      return o;
+    };
+
+    // ── Room bounds (computed from grid) ─────────────────────────────────────
+    const rows = Math.ceil(MAX_DESKS / COLS);
+    const gridW = (COLS - 1) * CELL;
+    const gridD = (rows - 1) * ROW_GAP;
+    const ROOM_W = gridW + 12;
+    const halfW = ROOM_W / 2;
+    const minZ = -6;
+    const maxZ = gridD + 8;
+    const ROOM_H = 4.4;
+
+    const slotPos = (slot: number): THREE.Vector3 => {
+      const col = slot % COLS;
+      const row = Math.floor(slot / COLS);
+      const x = (col - (COLS - 1) / 2) * CELL;
+      const z = row * ROW_GAP;
+      return new THREE.Vector3(x, 0, z);
+    };
+
+    // ── Shared Canvas2D textures ─────────────────────────────────────────────
+    function carpetTexture(): THREE.CanvasTexture {
+      const c = document.createElement("canvas");
+      c.width = c.height = 256;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#15182a";
+      ctx.fillRect(0, 0, 256, 256);
+      for (let i = 0; i < 5000; i++) {
+        const v = 18 + Math.random() * 26;
+        ctx.fillStyle = `rgb(${v * 0.7},${v * 0.8},${v + 12})`;
+        ctx.fillRect(Math.random() * 256, Math.random() * 256, 2, 2);
+      }
+      ctx.strokeStyle = "rgba(80,110,160,0.10)";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 256; i += 32) {
+        ctx.beginPath();
+        ctx.moveTo(i, 0);
+        ctx.lineTo(i, 256);
+        ctx.moveTo(0, i);
+        ctx.lineTo(256, i);
+        ctx.stroke();
+      }
+      const t = new THREE.CanvasTexture(c);
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }
+
+    function skylineTexture(): THREE.CanvasTexture {
+      const c = document.createElement("canvas");
+      c.width = 2048;
+      c.height = 512;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#0a0a18";
+      ctx.fillRect(0, 0, 2048, 512);
+      const bandY = 150;
+      const bandH = 230;
+      const g = ctx.createLinearGradient(0, bandY, 0, bandY + bandH);
+      g.addColorStop(0, "#1a1240");
+      g.addColorStop(0.55, "#2a1455");
+      g.addColorStop(1, "#451252");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, bandY, 2048, bandH);
+      for (let i = 0; i < 60; i++) {
+        const bw = 30 + Math.random() * 70;
+        const bx = Math.random() * 2048;
+        const bh = 60 + Math.random() * (bandH - 20);
+        ctx.fillStyle = "#0c0a22";
+        ctx.fillRect(bx, bandY + bandH - bh, bw, bh);
+        for (let wy = bandY + bandH - bh + 6; wy < bandY + bandH - 4; wy += 9) {
+          for (let wx = bx + 4; wx < bx + bw - 4; wx += 8) {
+            if (Math.random() < 0.45) {
+              ctx.fillStyle =
+                Math.random() < 0.6
+                  ? "rgba(255,210,120,0.9)"
+                  : "rgba(120,220,255,0.85)";
+              ctx.fillRect(wx, wy, 4, 5);
+            }
+          }
+        }
+      }
+      ctx.strokeStyle = "#05050d";
+      ctx.lineWidth = 8;
+      for (let x = 0; x <= 2048; x += 170) {
+        ctx.beginPath();
+        ctx.moveTo(x, bandY);
+        ctx.lineTo(x, bandY + bandH);
+        ctx.stroke();
+      }
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }
+
+    function whiteboardTexture(): THREE.CanvasTexture {
+      const c = document.createElement("canvas");
+      c.width = 512;
+      c.height = 320;
+      const ctx = c.getContext("2d")!;
+      ctx.fillStyle = "#f4f5f7";
+      ctx.fillRect(0, 0, 512, 320);
+      const cols = ["#2563eb", "#dc2626", "#16a34a", "#7c3aed"];
+      for (let i = 0; i < 9; i++) {
+        ctx.strokeStyle = cols[i % cols.length];
+        ctx.lineWidth = 2 + Math.random() * 3;
+        ctx.beginPath();
+        let x = 30 + Math.random() * 100;
+        let y = 30 + Math.random() * 260;
+        ctx.moveTo(x, y);
+        for (let k = 0; k < 5; k++) {
+          x += 40 + Math.random() * 60;
+          y += (Math.random() - 0.5) * 80;
+          ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#111";
+      ctx.font = "bold 30px sans-serif";
+      ctx.fillText("SPRINT", 30, 50);
+      ctx.font = "20px sans-serif";
+      ctx.fillText("ship it", 320, 290);
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }
+
+    function neonHerdrTexture(): THREE.CanvasTexture {
+      const c = document.createElement("canvas");
+      c.width = 1024;
+      c.height = 256;
+      const ctx = c.getContext("2d")!;
+      ctx.clearRect(0, 0, 1024, 256);
+      ctx.font = "bold 170px ui-sans-serif, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.shadowColor = "#22d3ee";
+      ctx.shadowBlur = 40;
+      ctx.fillStyle = "#a5f3fc";
+      ctx.fillText("herdr", 512, 138);
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = "#ecfeff";
+      ctx.fillText("herdr", 512, 138);
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }
+
+    // Scrolling code monitor texture (shared, redrawn ~18fps).
+    const codeCanvas = document.createElement("canvas");
+    codeCanvas.width = 256;
+    codeCanvas.height = 256;
+    const codeCtx = codeCanvas.getContext("2d")!;
+    const codeTex = track(new THREE.CanvasTexture(codeCanvas));
+    codeTex.colorSpace = THREE.SRGBColorSpace;
+    let codeScroll = 0;
+    const codeLines: string[] = [];
+    {
+      const toks = [
+        "const ",
+        "let ",
+        "return ",
+        "await herdr.",
+        "function ",
+        "if (status",
+        "  scene.add(",
+        "render()",
+        "  // TODO",
+        "import * as",
+        "for (let i",
+        "=> {",
+        "} catch (e)",
+        "this.update(",
+        "  paneId,",
+      ];
+      for (let i = 0; i < 40; i++) {
+        let s = "";
+        const n = 1 + Math.floor(Math.random() * 3);
+        for (let k = 0; k < n; k++)
+          s += toks[Math.floor(Math.random() * toks.length)];
+        codeLines.push(s.slice(0, 30));
+      }
+    }
+    const drawCode = () => {
+      codeCtx.fillStyle = "#04060e";
+      codeCtx.fillRect(0, 0, 256, 256);
+      codeCtx.font = "11px monospace";
+      const lh = 13;
+      const off = codeScroll % lh;
+      for (let i = -1; i < 256 / lh + 1; i++) {
+        const idx =
+          (Math.floor(codeScroll / lh) + i + codeLines.length * 4) %
+          codeLines.length;
+        const li = codeLines[idx];
+        const y = i * lh - off + 12;
+        codeCtx.fillStyle = i % 5 === 0 ? "#7dd3fc" : "#3b82f6";
+        codeCtx.fillText(li, 6, y);
+      }
+      codeTex.needsUpdate = true;
+    };
+    drawCode();
+
+    function bloomTexture(): THREE.CanvasTexture {
+      const c = document.createElement("canvas");
+      c.width = c.height = 128;
+      const ctx = c.getContext("2d")!;
+      const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+      g.addColorStop(0, "rgba(255,255,255,1)");
+      g.addColorStop(0.25, "rgba(255,255,255,0.7)");
+      g.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 128, 128);
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }
+
+    function ringTexture(): THREE.CanvasTexture {
+      const c = document.createElement("canvas");
+      c.width = c.height = 128;
+      const ctx = c.getContext("2d")!;
+      ctx.strokeStyle = "rgba(255,255,255,1)";
+      ctx.lineWidth = 10;
+      ctx.beginPath();
+      ctx.arc(64, 64, 50, 0, Math.PI * 2);
+      ctx.stroke();
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }
+
+    const carpetTex = track(carpetTexture());
+    carpetTex.repeat.set(ROOM_W / 2, (maxZ - minZ) / 2);
+    const skyTex = track(skylineTexture());
+    scene.background = skyTex;
+    const wbTex = track(whiteboardTexture());
+    const neonTex = track(neonHerdrTexture());
+    const bloomTex = track(bloomTexture());
+    const ringTex = track(ringTexture());
+
+    const bloomMat = track(
+      new THREE.SpriteMaterial({
+        map: bloomTex,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        transparent: true,
+        color: 0xffffff,
+      }),
+    );
+    const makeBloom = (color: number, scale: number, opacity: number) => {
+      const m = bloomMat.clone();
+      m.color = new THREE.Color(color);
+      m.opacity = opacity;
+      const s = new THREE.Sprite(m);
+      s.scale.setScalar(scale);
+      return s;
+    };
+
+    // ── Lighting ─────────────────────────────────────────────────────────────
+    scene.add(new THREE.AmbientLight(0x223044, 0.55));
+    scene.add(new THREE.HemisphereLight(0x334466, 0x110a18, 0.5));
+
+    const panelPositions = [
+      new THREE.Vector3(-halfW * 0.45, ROOM_H - 0.2, gridD * 0.25),
+      new THREE.Vector3(halfW * 0.45, ROOM_H - 0.2, gridD * 0.25),
+      new THREE.Vector3(-halfW * 0.45, ROOM_H - 0.2, gridD * 0.75),
+      new THREE.Vector3(halfW * 0.45, ROOM_H - 0.2, gridD * 0.75),
+    ];
+    panelPositions.forEach((p, i) => {
+      const sp = new THREE.SpotLight(0xbfd4ff, 2.2, 26, Math.PI / 3.2, 0.5, 1.2);
+      sp.position.copy(p);
+      sp.target.position.set(p.x, 0, p.z);
+      sp.castShadow = i < 2;
+      if (sp.castShadow) {
+        sp.shadow.mapSize.set(1024, 1024);
+        sp.shadow.camera.near = 0.5;
+        sp.shadow.camera.far = 26;
+        sp.shadow.bias = -0.0005;
+      }
+      scene.add(sp);
+      scene.add(sp.target);
+    });
+
+    // ── Materials (shared) ───────────────────────────────────────────────────
+    const floorMat = track(
+      new THREE.MeshStandardMaterial({
+        map: carpetTex,
+        roughness: 0.95,
+        metalness: 0.0,
+      }),
+    );
+    const wallMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x171b2a,
+        roughness: 0.9,
+        metalness: 0.05,
+        side: THREE.BackSide,
+      }),
+    );
+    const windowWallMat = track(
+      new THREE.MeshStandardMaterial({
+        map: skyTex,
+        emissiveMap: skyTex,
+        emissive: 0xffffff,
+        emissiveIntensity: 0.6,
+        roughness: 0.8,
+        metalness: 0.1,
+        side: THREE.BackSide,
+      }),
+    );
+    const ceilMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x0c0e18,
+        roughness: 0.95,
+        side: THREE.BackSide,
+      }),
+    );
+    const deskMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x3a2e26,
+        roughness: 0.6,
+        metalness: 0.15,
+      }),
+    );
+    const metalMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x55606e,
+        roughness: 0.35,
+        metalness: 0.7,
+      }),
+    );
+    const chairMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x1c1f2b,
+        roughness: 0.7,
+        metalness: 0.2,
+      }),
+    );
+    const skinMat = track(
+      new THREE.MeshStandardMaterial({ color: 0xd6a07a, roughness: 0.7 }),
+    );
+    const partitionMat = track(
+      new THREE.MeshStandardMaterial({ color: 0x2a3040, roughness: 0.85 }),
+    );
+
+    // ── Static geometry ──────────────────────────────────────────────────────
+    const cz = (minZ + maxZ) / 2;
+    const dimZ = maxZ - minZ;
+
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(ROOM_W, dimZ), floorMat);
     floor.rotation.x = -Math.PI / 2;
+    floor.position.set(0, 0, cz);
     floor.receiveShadow = true;
     scene.add(floor);
-    const grid = new THREE.GridHelper(300, 120, 0x2a2a3a, 0x1a1a24);
-    (grid.material as THREE.Material).transparent = true;
-    (grid.material as THREE.Material).opacity = 0.35;
-    scene.add(grid);
 
-    // ---- weapon view-model (simple gun at bottom of view) ----
+    const shellGeo = new THREE.BoxGeometry(ROOM_W, ROOM_H, dimZ);
+    const shell = new THREE.Mesh(shellGeo, wallMat);
+    shell.position.set(0, ROOM_H / 2, cz);
+    scene.add(shell);
+
+    const ceilGeo = new THREE.PlaneGeometry(ROOM_W, dimZ);
+    const ceil = new THREE.Mesh(ceilGeo, ceilMat);
+    ceil.rotation.x = Math.PI / 2;
+    ceil.position.set(0, ROOM_H, cz);
+    scene.add(ceil);
+
+    const backWallGeo = new THREE.PlaneGeometry(ROOM_W - 0.4, ROOM_H - 0.4);
+    const backWall = new THREE.Mesh(backWallGeo, windowWallMat);
+    backWall.position.set(0, ROOM_H / 2, maxZ - 0.05);
+    backWall.rotation.y = Math.PI;
+    scene.add(backWall);
+
+    const neonMat = track(
+      new THREE.MeshBasicMaterial({
+        map: neonTex,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    );
+    const neonGeo = new THREE.PlaneGeometry(6, 1.5);
+    const neon = new THREE.Mesh(neonGeo, neonMat);
+    neon.position.set(0, 3.4, maxZ - 0.12);
+    neon.rotation.y = Math.PI;
+    scene.add(neon);
+    const neonBloom = makeBloom(0x22d3ee, 7, 0.5);
+    neonBloom.position.set(0, 3.4, maxZ - 0.4);
+    scene.add(neonBloom);
+
+    const panelGeo = new THREE.PlaneGeometry(2.6, 1.4);
+    const panelMat = track(new THREE.MeshBasicMaterial({ color: 0xbfd4ff }));
+    const panelBlooms: THREE.Sprite[] = [];
+    panelPositions.forEach((p) => {
+      const pm = new THREE.Mesh(panelGeo, panelMat);
+      pm.rotation.x = Math.PI / 2;
+      pm.position.set(p.x, ROOM_H - 0.02, p.z);
+      scene.add(pm);
+      const b = makeBloom(0xbfd4ff, 4, 0.3);
+      b.position.set(p.x, ROOM_H - 0.3, p.z);
+      scene.add(b);
+      panelBlooms.push(b);
+    });
+
+    const wbMat = track(
+      new THREE.MeshStandardMaterial({ map: wbTex, roughness: 0.5 }),
+    );
+    const wbGeo = new THREE.PlaneGeometry(2.6, 1.6);
+    [-1, 1].forEach((side, i) => {
+      const wb = new THREE.Mesh(wbGeo, wbMat);
+      wb.position.set(side * (halfW - 0.1), 2.2, gridD * 0.3 + i * 4);
+      wb.rotation.y = side > 0 ? -Math.PI / 2 : Math.PI / 2;
+      scene.add(wb);
+    });
+
+    // ── Potted plants (instanced) ────────────────────────────────────────────
+    const plantSpots: THREE.Vector3[] = [
+      new THREE.Vector3(-halfW + 1, 0, minZ + 1.2),
+      new THREE.Vector3(halfW - 1, 0, minZ + 1.2),
+      new THREE.Vector3(-halfW + 1, 0, gridD * 0.5),
+      new THREE.Vector3(halfW - 1, 0, gridD * 0.5),
+      new THREE.Vector3(-halfW + 1, 0, maxZ - 2),
+      new THREE.Vector3(halfW - 1, 0, maxZ - 2),
+    ];
+    const potGeo = new THREE.CylinderGeometry(0.28, 0.22, 0.45, 10);
+    const potMat = track(
+      new THREE.MeshStandardMaterial({ color: 0x8a5a3a, roughness: 0.8 }),
+    );
+    const leafGeo = new THREE.ConeGeometry(0.45, 1.1, 8);
+    const leafMat = track(
+      new THREE.MeshStandardMaterial({ color: 0x2f7d4f, roughness: 0.8 }),
+    );
+    const potInst = new THREE.InstancedMesh(potGeo, potMat, plantSpots.length);
+    const leafInst = new THREE.InstancedMesh(leafGeo, leafMat, plantSpots.length);
+    const dummy = new THREE.Object3D();
+    plantSpots.forEach((p, i) => {
+      dummy.position.set(p.x, 0.22, p.z);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      potInst.setMatrixAt(i, dummy.matrix);
+      dummy.position.set(p.x, 1.0, p.z);
+      dummy.updateMatrix();
+      leafInst.setMatrixAt(i, dummy.matrix);
+    });
+    potInst.instanceMatrix.needsUpdate = true;
+    leafInst.instanceMatrix.needsUpdate = true;
+    scene.add(potInst);
+    scene.add(leafInst);
+
+    // ── Server racks with blinking LEDs (instanced) ──────────────────────────
+    const rackGroup = new THREE.Group();
+    const rackGeo = new THREE.BoxGeometry(0.9, 2.6, 0.7);
+    const rackMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x14161f,
+        roughness: 0.4,
+        metalness: 0.6,
+      }),
+    );
+    const rackSpots = [
+      new THREE.Vector3(-halfW + 1.2, 1.3, maxZ - 2),
+      new THREE.Vector3(-halfW + 2.3, 1.3, maxZ - 2),
+      new THREE.Vector3(halfW - 1.2, 1.3, maxZ - 2),
+      new THREE.Vector3(halfW - 2.3, 1.3, maxZ - 2),
+    ];
+    rackSpots.forEach((p) => {
+      const r = new THREE.Mesh(rackGeo, rackMat);
+      r.position.copy(p);
+      rackGroup.add(r);
+    });
+    scene.add(rackGroup);
+
+    const LED_PER_RACK = 18;
+    const ledCount = rackSpots.length * LED_PER_RACK;
+    const ledGeo = new THREE.BoxGeometry(0.06, 0.06, 0.03);
+    const ledMat = track(
+      new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false }),
+    );
+    const ledInst = new THREE.InstancedMesh(ledGeo, ledMat, ledCount);
+    const ledColors = new Float32Array(ledCount * 3);
+    const ledColor = new THREE.Color();
+    let li = 0;
+    rackSpots.forEach((p) => {
+      for (let k = 0; k < LED_PER_RACK; k++) {
+        const row = k % 9;
+        const coli = k < 9 ? 0 : 1;
+        dummy.position.set(
+          p.x - 0.3 + coli * 0.6,
+          p.y + 1.0 - row * 0.26,
+          p.z + 0.36,
+        );
+        dummy.rotation.set(0, 0, 0);
+        dummy.scale.set(1, 1, 1);
+        dummy.updateMatrix();
+        ledInst.setMatrixAt(li, dummy.matrix);
+        ledColor.setHSL(Math.random(), 0.9, 0.5);
+        ledColor.toArray(ledColors, li * 3);
+        li++;
+      }
+    });
+    ledInst.instanceMatrix.needsUpdate = true;
+    ledInst.instanceColor = new THREE.InstancedBufferAttribute(ledColors, 3);
+    scene.add(ledInst);
+
+    // ── Partitions between cubicles (instanced) ──────────────────────────────
+    const partGeo = new THREE.BoxGeometry(0.08, 1.3, 3.6);
+    const partCount = (COLS + 1) * rows;
+    const partInst = new THREE.InstancedMesh(partGeo, partitionMat, partCount);
+    let pi = 0;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c <= COLS; c++) {
+        const x = (c - COLS / 2) * CELL;
+        const z = r * ROW_GAP - 0.3;
+        dummy.position.set(x, 0.85, z);
+        dummy.rotation.set(0, 0, 0);
+        dummy.scale.set(1, 1, 1);
+        dummy.updateMatrix();
+        partInst.setMatrixAt(pi++, dummy.matrix);
+      }
+    }
+    partInst.instanceMatrix.needsUpdate = true;
+    scene.add(partInst);
+
+    // ── Shared geometries for rigs ───────────────────────────────────────────
+    const deskTopGeo = new THREE.BoxGeometry(2.6, 0.1, 1.3);
+    const deskLegGeo = new THREE.BoxGeometry(0.1, 0.78, 0.1);
+    const monitorGeo = new THREE.BoxGeometry(1.0, 0.6, 0.05);
+    const monitorStandGeo = new THREE.BoxGeometry(0.1, 0.3, 0.1);
+    const headGeo = new THREE.SphereGeometry(0.22, 16, 16);
+    const torsoGeo = new THREE.CapsuleGeometry(0.26, 0.5, 4, 12);
+    const armGeo = new THREE.CapsuleGeometry(0.07, 0.42, 4, 8);
+    const bodyHitGeo = new THREE.BoxGeometry(0.6, 0.9, 0.45);
+    const headHitGeo = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+    const mugGeo = new THREE.CylinderGeometry(0.07, 0.06, 0.13, 10);
+    const paperGeo = new THREE.BoxGeometry(0.3, 0.01, 0.4);
+    const seatGeo = new THREE.BoxGeometry(0.5, 0.08, 0.5);
+    const seatBackGeo = new THREE.BoxGeometry(0.5, 0.6, 0.08);
+    const poleGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.45, 8);
+
+    const monMatScreen = track(
+      new THREE.MeshStandardMaterial({
+        map: codeTex,
+        emissiveMap: codeTex,
+        emissive: 0xffffff,
+        emissiveIntensity: 2.5,
+        roughness: 0.4,
+        metalness: 0.1,
+      }),
+    );
+    const mugMat = track(
+      new THREE.MeshStandardMaterial({ color: 0xcc4444, roughness: 0.5 }),
+    );
+    const paperMat = track(
+      new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.9 }),
+    );
+    const hitMat = track(new THREE.MeshBasicMaterial({ visible: false }));
+
+    const buildChair = (): THREE.Group => {
+      const g = new THREE.Group();
+      const seat = new THREE.Mesh(seatGeo, chairMat);
+      seat.position.y = 0.5;
+      const back = new THREE.Mesh(seatBackGeo, chairMat);
+      back.position.set(0, 0.82, -0.24);
+      const pole = new THREE.Mesh(poleGeo, metalMat);
+      pole.position.y = 0.27;
+      g.add(seat, back, pole);
+      return g;
+    };
+
+    function buildRig(slot: number, a: Agent): Rig {
+      const pos = slotPos(slot);
+      const group = new THREE.Group();
+      group.position.copy(pos);
+
+      const desk = new THREE.Mesh(deskTopGeo, deskMat);
+      desk.position.set(0, 0.82, 0.2);
+      desk.castShadow = true;
+      desk.receiveShadow = true;
+      group.add(desk);
+      for (const [lx, lz] of [
+        [-1.2, -0.5],
+        [1.2, -0.5],
+        [-1.2, 0.9],
+        [1.2, 0.9],
+      ] as const) {
+        const leg = new THREE.Mesh(deskLegGeo, metalMat);
+        leg.position.set(lx, 0.39, 0.2 + lz);
+        group.add(leg);
+      }
+
+      const monitorMat = monMatScreen.clone();
+      const monitor = new THREE.Mesh(monitorGeo, monitorMat);
+      monitor.position.set(0, 1.35, 0.0);
+      monitor.rotation.y = Math.PI;
+      group.add(monitor);
+      const stand = new THREE.Mesh(monitorStandGeo, metalMat);
+      stand.position.set(0, 1.0, 0.0);
+      group.add(stand);
+
+      const st = STATUS[safeStatus(a.agent_status)];
+      const bloom = makeBloom(st.c, 1.6, 0.5);
+      bloom.position.set(0, 1.35, 0.1);
+      group.add(bloom);
+
+      const light = new THREE.PointLight(st.c, st.i, 4.5, 2);
+      light.position.set(0, 1.45, 0.2);
+      group.add(light);
+
+      const mug = new THREE.Mesh(mugGeo, mugMat);
+      mug.position.set(-0.9, 0.93, 0.3);
+      group.add(mug);
+      const paper = new THREE.Mesh(paperGeo, paperMat);
+      paper.position.set(0.85, 0.88, 0.4);
+      paper.rotation.y = 0.3;
+      group.add(paper);
+
+      const chair = buildChair();
+      chair.position.set(0, 0, 1.0);
+      group.add(chair);
+
+      const torso = new THREE.Mesh(torsoGeo, chairMat.clone());
+      torso.position.set(0, 1.05, 1.0);
+      group.add(torso);
+      const head = new THREE.Mesh(headGeo, skinMat);
+      head.position.set(0, 1.55, 1.0);
+      group.add(head);
+      const armL = new THREE.Mesh(armGeo, chairMat.clone());
+      armL.position.set(-0.28, 1.1, 0.7);
+      armL.rotation.z = 0.5;
+      armL.rotation.x = -0.6;
+      group.add(armL);
+      const armR = new THREE.Mesh(armGeo, chairMat.clone());
+      armR.position.set(0.28, 1.1, 0.7);
+      armR.rotation.z = -0.5;
+      armR.rotation.x = -0.6;
+      group.add(armR);
+
+      const body = new THREE.Mesh(bodyHitGeo, hitMat);
+      body.position.set(0, 1.1, 1.0);
+      body.userData = { paneId: a.pane_id, part: "body" };
+      group.add(body);
+      const headBox = new THREE.Mesh(headHitGeo, hitMat);
+      headBox.position.set(0, 1.55, 1.0);
+      headBox.userData = { paneId: a.pane_id, part: "head" };
+      group.add(headBox);
+
+      const { texture: signTex, aspect } = makeLabelTexture(repoName(a));
+      const signMat = new THREE.SpriteMaterial({
+        map: signTex,
+        depthWrite: false,
+        transparent: true,
+      });
+      const sign = new THREE.Sprite(signMat);
+      sign.scale.set(1.6, 1.6 / aspect, 1);
+      sign.position.set(0, 2.4, 0.5);
+      group.add(sign);
+
+      scene.add(group);
+
+      return {
+        group,
+        monitorMat,
+        light,
+        bloom,
+        head: headBox,
+        body,
+        torso,
+        armL,
+        armR,
+        chair,
+        sign,
+        signTex,
+        status: safeStatus(a.agent_status),
+        targetColor: new THREE.Color(st.c),
+        targetIntensity: st.i,
+        paneId: a.pane_id,
+        focused: !!a.focused,
+        seed: Math.random() * 100,
+        slot,
+        dead: false,
+        deathT: 0,
+        signText: repoName(a),
+      };
+    }
+
+    // ── Rig registry & slot assignment ───────────────────────────────────────
+    const rigs = new Map<string, Rig>();
+    const slotByKey = new Map<string, number>();
+    const usedSlots = new Set<number>();
+    const hitCounts = new Map<string, number>();
+    const killing = new Set<string>();
+    const bubbleCache = new Map<string, string>();
+    let killfeedId = 0;
+
+    const keyOf = (a: Agent) => a.workspace_id || a.pane_id;
+
+    const assignSlot = (key: string): number => {
+      const existing = slotByKey.get(key);
+      if (existing !== undefined) return existing;
+      for (let s = 0; s < MAX_DESKS; s++) {
+        if (!usedSlots.has(s)) {
+          usedSlots.add(s);
+          slotByKey.set(key, s);
+          return s;
+        }
+      }
+      // Overflow: all MAX_DESKS slots are taken. Return a sentinel so the
+      // caller skips rendering this agent rather than colliding on slot 0.
+      return -1;
+    };
+
+    // ── VFX pools ────────────────────────────────────────────────────────────
+    const scratchV = new THREE.Vector3();
+    const scratchV2 = new THREE.Vector3();
+
+    const TRACER_N = 8;
+    interface Tracer {
+      line: THREE.Line;
+      mat: THREE.LineBasicMaterial;
+      t: number;
+    }
+    const tracers: Tracer[] = [];
+    for (let i = 0; i < TRACER_N; i++) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute(
+        "position",
+        new THREE.BufferAttribute(new Float32Array(6), 3),
+      );
+      const mat = new THREE.LineBasicMaterial({
+        color: 0xfff4aa,
+        transparent: true,
+        opacity: 0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const line = new THREE.Line(g, mat);
+      line.frustumCulled = false;
+      scene.add(line);
+      tracers.push({ line, mat, t: 0 });
+    }
+    let tracerIdx = 0;
+    const fireTracer = (from: THREE.Vector3, to: THREE.Vector3) => {
+      const tr = tracers[tracerIdx++ % TRACER_N];
+      const pos = tr.line.geometry.getAttribute(
+        "position",
+      ) as THREE.BufferAttribute;
+      pos.setXYZ(0, from.x, from.y, from.z);
+      pos.setXYZ(1, to.x, to.y, to.z);
+      pos.needsUpdate = true;
+      tr.mat.opacity = 0.9;
+      tr.t = 1;
+    };
+
+    const IMPACT_N = 3;
+    interface Impact {
+      light: THREE.PointLight;
+      t: number;
+    }
+    const impacts: Impact[] = [];
+    for (let i = 0; i < IMPACT_N; i++) {
+      const l = new THREE.PointLight(0xff8844, 0, 3, 2);
+      scene.add(l);
+      impacts.push({ light: l, t: 0 });
+    }
+    let impactIdx = 0;
+    const popImpact = (p: THREE.Vector3, color: number, power: number) => {
+      const im = impacts[impactIdx++ % IMPACT_N];
+      im.light.position.copy(p);
+      im.light.color.setHex(color);
+      im.light.intensity = power;
+      im.t = 1;
+    };
+
+    const SPARK_N = 48;
+    interface Particle {
+      sprite: THREE.Sprite;
+      vel: THREE.Vector3;
+      t: number;
+      grav: number;
+      kind: "spark" | "poof" | "confetti" | "ring";
+    }
+    const particles: Particle[] = [];
+    for (let i = 0; i < SPARK_N; i++) {
+      const m = bloomMat.clone();
+      m.opacity = 0;
+      const s = new THREE.Sprite(m);
+      s.scale.setScalar(0.2);
+      s.visible = false;
+      scene.add(s);
+      particles.push({
+        sprite: s,
+        vel: new THREE.Vector3(),
+        t: 0,
+        grav: 0,
+        kind: "spark",
+      });
+    }
+    let partIdx = 0;
+    const spawnParticle = (
+      p: THREE.Vector3,
+      color: number,
+      kind: Particle["kind"],
+      speed: number,
+      scale: number,
+    ) => {
+      const pt = particles[partIdx++ % SPARK_N];
+      pt.sprite.position.copy(p);
+      pt.sprite.visible = true;
+      pt.sprite.scale.setScalar(scale);
+      const m = pt.sprite.material as THREE.SpriteMaterial;
+      m.color.setHex(color);
+      m.opacity = 1;
+      m.map = kind === "ring" ? ringTex : bloomTex;
+      pt.vel.set(
+        (Math.random() - 0.5) * speed,
+        Math.random() * speed,
+        (Math.random() - 0.5) * speed,
+      );
+      pt.grav = kind === "confetti" ? -4 : kind === "spark" ? -2 : 0;
+      pt.t = 1;
+      pt.kind = kind;
+    };
+    const burst = (
+      p: THREE.Vector3,
+      color: number,
+      kind: Particle["kind"],
+      n: number,
+      speed: number,
+      scale: number,
+    ) => {
+      for (let i = 0; i < n; i++) spawnParticle(p, color, kind, speed, scale);
+    };
+
+    const SHELL_N = 10;
+    interface Shell {
+      mesh: THREE.Mesh;
+      vel: THREE.Vector3;
+      av: THREE.Vector3;
+      t: number;
+    }
+    const shellGeo2 = new THREE.CylinderGeometry(0.012, 0.012, 0.05, 6);
+    const shellMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0xd4a017,
+        metalness: 0.8,
+        roughness: 0.3,
+      }),
+    );
+    const shells: Shell[] = [];
+    for (let i = 0; i < SHELL_N; i++) {
+      const m = new THREE.Mesh(shellGeo2, shellMat);
+      m.visible = false;
+      scene.add(m);
+      shells.push({
+        mesh: m,
+        vel: new THREE.Vector3(),
+        av: new THREE.Vector3(),
+        t: 0,
+      });
+    }
+    let shellIdx = 0;
+    const ejectShell = () => {
+      const sh = shells[shellIdx++ % SHELL_N];
+      camera.getWorldPosition(scratchV);
+      camera.getWorldDirection(scratchV2);
+      sh.mesh.position.copy(scratchV).addScaledVector(scratchV2, 0.3);
+      sh.mesh.position.y -= 0.2;
+      sh.mesh.visible = true;
+      sh.vel.set(
+        (Math.random() - 0.2) * 2 + 1.5,
+        2 + Math.random(),
+        (Math.random() - 0.5) * 2,
+      );
+      sh.av.set(Math.random() * 10, Math.random() * 10, Math.random() * 10);
+      sh.t = 1.2;
+    };
+
+    // ── Coffee pickups ───────────────────────────────────────────────────────
+    interface Pickup {
+      mesh: THREE.Mesh;
+      bloom: THREE.Sprite;
+      active: boolean;
+      respawn: number;
+      basePos: THREE.Vector3;
+    }
+    const pickups: Pickup[] = [];
+    const pickupSpots = [
+      new THREE.Vector3(-CELL, 0.95, gridD * 0.3),
+      new THREE.Vector3(CELL, 0.95, gridD * 0.6),
+      new THREE.Vector3(0, 0.95, gridD + 3),
+    ];
+    const pickupMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x6f4e37,
+        emissive: 0x4422aa,
+        emissiveIntensity: 0.6,
+        roughness: 0.5,
+      }),
+    );
+    pickupSpots.forEach((p) => {
+      const m = new THREE.Mesh(mugGeo, pickupMat);
+      m.scale.setScalar(1.4);
+      m.position.copy(p);
+      scene.add(m);
+      const b = makeBloom(0x88aaff, 0.8, 0.6);
+      b.position.copy(p);
+      scene.add(b);
+      pickups.push({
+        mesh: m,
+        bloom: b,
+        active: true,
+        respawn: 0,
+        basePos: p.clone(),
+      });
+    });
+
+    // ── WebAudio synth ───────────────────────────────────────────────────────
+    let audioCtx: AudioContext | null = null;
+    let master: GainNode | null = null;
+    let ambientOsc: OscillatorNode | null = null;
+    let cachedNoise: AudioBuffer | null = null;
+    const initAudio = () => {
+      if (audioCtx) return;
+      const AC =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      audioCtx = new AC();
+      master = audioCtx.createGain();
+      master.gain.value = 0.6;
+      master.connect(audioCtx.destination);
+      ambientOsc = audioCtx.createOscillator();
+      ambientOsc.type = "sawtooth";
+      ambientOsc.frequency.value = 58;
+      const hg = audioCtx.createGain();
+      hg.gain.value = 0.012;
+      const hf = audioCtx.createBiquadFilter();
+      hf.type = "lowpass";
+      hf.frequency.value = 200;
+      ambientOsc.connect(hf);
+      hf.connect(hg);
+      hg.connect(master);
+      ambientOsc.start();
+    };
+    const sfxGun = () => {
+      if (!audioCtx || !master) return;
+      const ctx = audioCtx;
+      if (!cachedNoise) {
+        const b = ctx.createBuffer(1, ctx.sampleRate * 0.3, ctx.sampleRate);
+        const d = b.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        cachedNoise = b;
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = cachedNoise;
+      const f = ctx.createBiquadFilter();
+      f.type = "lowpass";
+      f.frequency.setValueAtTime(2400, ctx.currentTime);
+      f.frequency.exponentialRampToValueAtTime(200, ctx.currentTime + 0.18);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.55, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
+      src.connect(f);
+      f.connect(g);
+      g.connect(master);
+      src.start();
+      src.stop(ctx.currentTime + 0.22);
+    };
+    const beep = (
+      freq: number,
+      dur: number,
+      type: OscillatorType,
+      vol: number,
+      slide?: number,
+    ) => {
+      if (!audioCtx || !master) return;
+      const ctx = audioCtx;
+      const o = ctx.createOscillator();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, ctx.currentTime);
+      if (slide)
+        o.frequency.exponentialRampToValueAtTime(slide, ctx.currentTime + dur);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(vol, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
+      o.connect(g);
+      g.connect(master);
+      o.start();
+      o.stop(ctx.currentTime + dur + 0.02);
+    };
+    const sfxHit = () => beep(1400, 0.06, "square", 0.18);
+    const sfxHeadshot = () => {
+      beep(1800, 0.08, "square", 0.2);
+      beep(2400, 0.07, "sine", 0.14, 1200);
+    };
+    const sfxKill = () => {
+      beep(440, 0.09, "triangle", 0.22, 660);
+      window.setTimeout(() => beep(660, 0.09, "triangle", 0.22, 880), 80);
+      window.setTimeout(() => beep(880, 0.12, "triangle", 0.22, 1100), 160);
+    };
+    const sfxReload = () => {
+      beep(220, 0.04, "square", 0.2);
+      window.setTimeout(() => beep(300, 0.05, "square", 0.2), 220);
+    };
+    const sfxEmpty = () => beep(180, 0.05, "square", 0.15);
+    const sfxShield = () => {
+      beep(900, 0.12, "sine", 0.2, 1600);
+      beep(1300, 0.1, "triangle", 0.12);
+    };
+    const sfxPickup = () => {
+      beep(880, 0.08, "sine", 0.18, 1320);
+      window.setTimeout(() => beep(1320, 0.1, "sine", 0.18, 1760), 60);
+    };
+    const sfxStep = () => beep(90, 0.05, "sine", 0.06);
+
+    // ── Player & combat state ────────────────────────────────────────────────
+    const player = {
+      pos: new THREE.Vector3(0, EYE, minZ - 3),
+      vel: new THREE.Vector3(),
+      yaw: 0,
+      pitch: 0,
+      onGround: true,
+      crouch: false,
+      sprint: false,
+      stamina: 100,
+      health: 100,
+      bob: 0,
+      bobStep: 0,
+    };
+    const keys: Record<string, boolean> = {};
+    const combat = {
+      ammo: MAG_SIZE,
+      reserve: RESERVE_MAX,
+      reloading: false,
+      reloadEnd: 0,
+      lastShot: 0,
+      ads: false,
+      recoil: 0,
+      shake: 0,
+      kick: 0,
+      score: 0,
+      combo: 1,
+      comboTimer: 0,
+      highScore: 0,
+    };
+    try {
+      combat.highScore = Number(localStorage.getItem("herdr-fps-hi") || "0");
+    } catch {
+      combat.highScore = 0;
+    }
+    pushHud({ highScore: combat.highScore });
+    let lastHeadshot = false;
+
+    // Gun viewmodel.
     const gun = new THREE.Group();
-    const gunMat = new THREE.MeshStandardMaterial({ color: 0x111118, roughness: 0.4, metalness: 0.6 });
-    const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.12, 0.7), gunMat);
-    barrel.position.set(0.28, -0.26, -0.6);
-    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.28, 0.16), gunMat);
-    grip.position.set(0.28, -0.42, -0.32);
-    grip.rotation.x = 0.3;
-    gun.add(barrel, grip);
-    const muzzle = new THREE.PointLight(0xffaa33, 0, 6);
-    muzzle.position.set(0.28, -0.26, -0.95);
-    gun.add(muzzle);
+    const gunBodyGeo = new THREE.BoxGeometry(0.12, 0.14, 0.5);
+    const gunBarrelGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.4, 8);
+    const gunBody = new THREE.Mesh(gunBodyGeo, metalMat);
+    const gunBarrel = new THREE.Mesh(gunBarrelGeo, metalMat);
+    gunBarrel.rotation.x = Math.PI / 2;
+    gunBarrel.position.set(0, 0.04, -0.4);
+    gun.add(gunBody, gunBarrel);
+    gun.position.set(0.22, -0.22, -0.45);
     camera.add(gun);
     scene.add(camera);
 
-    // ---- FPS controls ----
-    let yaw = Math.PI, pitch = -0.12;
-    const keys = new Set<string>();
-    const onKeyDown = (e: KeyboardEvent) => keys.add(e.code);
-    const onKeyUp = (e: KeyboardEvent) => keys.delete(e.code);
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
+    const muzzleLight = new THREE.PointLight(0xffcc66, 0, 4, 2);
+    muzzleLight.position.set(0, 0.04, -0.7);
+    gun.add(muzzleLight);
+    const muzzleBloom = makeBloom(0xffdd88, 0.6, 0);
+    muzzleBloom.position.set(0, 0.04, -0.7);
+    gun.add(muzzleBloom);
 
-    const dom = renderer.domElement;
-    const onClickCanvas = () => {
-      if (document.pointerLockElement !== dom) dom.requestPointerLock();
+    const exposure = { val: 1.1, target: 1.1 };
+    const raycaster = new THREE.Raycaster();
+
+    // ── Speech bubble for done agents ────────────────────────────────────────
+    const hideBubble = (rig: Rig) => {
+      if (rig.bubble) {
+        rig.group.remove(rig.bubble);
+        (rig.bubble.material as THREE.SpriteMaterial).dispose();
+        rig.bubbleTex?.dispose();
+        rig.bubble = undefined;
+        rig.bubbleTex = undefined;
+      }
     };
-    dom.addEventListener("click", onClickCanvas);
-    const onLockChange = () => setLocked(document.pointerLockElement === dom);
+    const showBubble = async (rig: Rig) => {
+      if (rig.bubble) return;
+      let msg = bubbleCache.get(rig.paneId);
+      if (msg === undefined) {
+        try {
+          const r = await herdr.bubble(rig.paneId);
+          msg = r.message || "done";
+        } catch {
+          msg = "done";
+        }
+        bubbleCache.set(rig.paneId, msg);
+      }
+      if (rig.dead || rig.bubble) return;
+      const text = msg.slice(0, 80) || "done";
+      const { texture, aspect } = makeLabelTexture(text, {
+        rtl: isHebrew(text),
+        bg: "#dcfce7",
+        border: "#16a34a",
+      });
+      const mat = new THREE.SpriteMaterial({
+        map: texture,
+        depthWrite: false,
+        transparent: true,
+      });
+      const s = new THREE.Sprite(mat);
+      s.scale.set(2.2, 2.2 / aspect, 1);
+      s.position.set(0, 3.0, 0.5);
+      rig.group.add(s);
+      rig.bubble = s;
+      rig.bubbleTex = texture;
+    };
+
+    // ── Kill handling ────────────────────────────────────────────────────────
+    const registerKill = (paneId: string, dyingRig: Rig | undefined) => {
+      if (killing.has(paneId)) return;
+      killing.add(paneId);
+      if (dyingRig) {
+        dyingRig.dead = true;
+        dyingRig.deathT = 1;
+        dyingRig.group.getWorldPosition(scratchV);
+        scratchV.y += 1.3;
+        burst(scratchV, 0xff3322, "poof", 12, 3, 1.4);
+        popImpact(scratchV, 0xff2200, 4);
+      }
+      const headshot = lastHeadshot;
+      const base = 100;
+      const bonus = headshot ? 50 : 0;
+      combat.combo = Math.min(8, combat.combo + 1);
+      combat.comboTimer = 3.5;
+      combat.score += (base + bonus) * combat.combo;
+      if (combat.score > combat.highScore) {
+        combat.highScore = combat.score;
+        try {
+          localStorage.setItem("herdr-fps-hi", String(combat.highScore));
+        } catch {
+          /* ignore */
+        }
+      }
+      sfxKill();
+      exposure.target = 0.7;
+      window.setTimeout(
+        () => (exposure.target = combat.ads ? 1.25 : 1.1),
+        120,
+      );
+      killfeedId++;
+      const kid = killfeedId;
+      const repo = dyingRig?.signText || paneId;
+      hudData.killfeed = [
+        ...hudData.killfeed,
+        {
+          id: kid,
+          text: `${headshot ? "HEADSHOT " : ""}eliminated ${repo} x${combat.combo}`,
+          color: "#ff5544",
+        },
+      ].slice(-5);
+      pushHud({
+        score: combat.score,
+        combo: combat.combo,
+        killFlash: performance.now(),
+        highScore: combat.highScore,
+      });
+      window.setTimeout(() => {
+        hudData.killfeed = hudData.killfeed.filter((k) => k.id !== kid);
+        hudDirty = true;
+      }, 4000);
+      herdr.kill(paneId).catch(() => {
+        /* best effort */
+      });
+    };
+
+    const reload = () => {
+      if (combat.reloading || combat.ammo >= MAG_SIZE || combat.reserve <= 0)
+        return;
+      combat.reloading = true;
+      combat.reloadEnd = performance.now() + 1100;
+      sfxReload();
+      pushHud({ reloading: true });
+    };
+
+    const shoot = () => {
+      const now = performance.now();
+      if (combat.reloading) return;
+      if (now - combat.lastShot < 110) return;
+      if (combat.ammo <= 0) {
+        sfxEmpty();
+        reload();
+        return;
+      }
+      combat.lastShot = now;
+      combat.ammo--;
+      pushHud({ ammo: combat.ammo });
+      sfxGun();
+      ejectShell();
+      muzzleLight.intensity = 5;
+      (muzzleBloom.material as THREE.SpriteMaterial).opacity = 1;
+      combat.recoil = Math.min(1, combat.recoil + 0.18);
+      combat.kick = 0.05 + combat.recoil * 0.06;
+      combat.shake = 0.35;
+      exposure.target = 1.6;
+      window.setTimeout(() => (exposure.target = combat.ads ? 1.25 : 1.1), 60);
+      player.pitch += combat.kick * 0.6;
+
+      camera.getWorldPosition(scratchV);
+      camera.getWorldDirection(scratchV2);
+      const moving = player.vel.lengthSq() > 0.2;
+      const spread =
+        (combat.recoil * 0.04 + (combat.ads ? 0 : 0.012)) * (moving ? 1.6 : 1);
+      scratchV2.x += (Math.random() - 0.5) * spread;
+      scratchV2.y += (Math.random() - 0.5) * spread;
+      scratchV2.z += (Math.random() - 0.5) * spread;
+      scratchV2.normalize();
+      raycaster.set(scratchV, scratchV2);
+      raycaster.far = 120;
+
+      const targets: THREE.Object3D[] = [];
+      rigs.forEach((r) => {
+        if (!r.dead) {
+          targets.push(r.head, r.body);
+        }
+      });
+      const hits = raycaster.intersectObjects(targets, false);
+      const muzzleWorld = gun.localToWorld(new THREE.Vector3(0, 0.04, -0.7));
+      let endPoint = scratchV
+        .clone()
+        .add(scratchV2.clone().multiplyScalar(60));
+      if (hits.length) {
+        const hit = hits[0];
+        endPoint = hit.point.clone();
+        const paneId = hit.object.userData.paneId as string;
+        const part = hit.object.userData.part as string;
+        let rig: Rig | undefined;
+        rigs.forEach((r) => {
+          if (r.paneId === paneId) rig = r;
+        });
+        if (rig && rig.focused) {
+          burst(endPoint, 0x33ccff, "ring", 1, 0, 1.2);
+          popImpact(endPoint, 0x33aaff, 3);
+          sfxShield();
+          pushHud({ shieldHint: performance.now() });
+        } else if (rig && !rig.dead) {
+          const headshot = part === "head";
+          lastHeadshot = headshot;
+          burst(endPoint, 0xffaa44, "spark", 6, 4, 0.3);
+          popImpact(endPoint, 0xff8844, 2);
+          const inc = headshot ? HITS_TO_KILL : 1;
+          const c = (hitCounts.get(paneId) || 0) + inc;
+          hitCounts.set(paneId, c);
+          if (headshot) sfxHeadshot();
+          else sfxHit();
+          pushHud({ hitmarker: performance.now(), headshot });
+          if (c >= HITS_TO_KILL) registerKill(paneId, rig);
+        }
+      }
+      fireTracer(muzzleWorld, endPoint);
+    };
+
+    const melee = () => {
+      camera.getWorldPosition(scratchV);
+      combat.shake = 0.2;
+      let nearest: Rig | undefined;
+      let nd = 2.2;
+      rigs.forEach((r) => {
+        if (r.dead) return;
+        r.group.getWorldPosition(scratchV2);
+        scratchV2.y = scratchV.y;
+        const d = scratchV.distanceTo(scratchV2);
+        if (d < nd) {
+          nd = d;
+          nearest = r;
+        }
+      });
+      if (nearest) {
+        if (nearest.focused) {
+          nearest.group.getWorldPosition(scratchV);
+          scratchV.y += 1.3;
+          burst(scratchV, 0x33ccff, "ring", 1, 0, 1.2);
+          sfxShield();
+          pushHud({ shieldHint: performance.now() });
+        } else {
+          const c = (hitCounts.get(nearest.paneId) || 0) + 1;
+          hitCounts.set(nearest.paneId, c);
+          sfxHit();
+          lastHeadshot = false;
+          pushHud({ hitmarker: performance.now(), headshot: false });
+          if (c >= HITS_TO_KILL) registerKill(nearest.paneId, nearest);
+        }
+      }
+    };
+
+    const interact = () => {
+      camera.getWorldPosition(scratchV);
+      camera.getWorldDirection(scratchV2);
+      raycaster.set(scratchV, scratchV2);
+      raycaster.far = 6;
+      const targets: THREE.Object3D[] = [];
+      rigs.forEach((r) => {
+        if (!r.dead) targets.push(r.body);
+      });
+      const hits = raycaster.intersectObjects(targets, false);
+      if (hits.length) {
+        const paneId = hits[0].object.userData.paneId as string;
+        herdr.focus(paneId).catch(() => {});
+        let rig: Rig | undefined;
+        rigs.forEach((r) => {
+          if (r.paneId === paneId) rig = r;
+        });
+        if (rig) showBubble(rig);
+        sfxPickup();
+      }
+    };
+
+    // ── Pointer lock & input ─────────────────────────────────────────────────
+    const canvasEl = renderer.domElement;
+    let locked = false;
+
+    const onLockChange = () => {
+      locked = document.pointerLockElement === canvasEl;
+      pushHud({ locked });
+      if (locked) pushHud({ paused: false });
+    };
     document.addEventListener("pointerlockchange", onLockChange);
 
     const onMouseMove = (e: MouseEvent) => {
-      if (document.pointerLockElement !== dom) return;
-      yaw -= e.movementX * 0.0022;
-      pitch = Math.max(-1.2, Math.min(0.5, pitch - e.movementY * 0.0022));
+      if (!locked) return;
+      const sens = combat.ads ? 0.0014 : 0.0024;
+      player.yaw -= e.movementX * sens;
+      player.pitch -= e.movementY * sens;
+      const lim = Math.PI / 2 - 0.05;
+      player.pitch = Math.max(-lim, Math.min(lim, player.pitch));
     };
-    document.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mousemove", onMouseMove);
 
-    // ---- shooting ----
-    const raycaster = new THREE.Raycaster();
-    let recoil = 0;
-    let tracer: THREE.Line | null = null;
-    let tracerLife = 0;
-
-    const shoot = () => {
-      recoil = 1;
-      muzzle.intensity = 4;
-      raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-      const live = hitboxesRef.current.filter(
-        (m) => m.userData.present && !m.userData.dead,
-      );
-      const hits = raycaster.intersectObjects(live, false);
-      const origin = new THREE.Vector3();
-      camera.getWorldPosition(origin);
-      let end = origin.clone().add(raycaster.ray.direction.clone().multiplyScalar(60));
-      if (hits.length) {
-        end = hits[0].point.clone();
-        const office = officesRef.current.get(hits[0].object.userData.officeId as string);
-        if (office) registerHit(office, hits[0].point);
+    let lmb = false;
+    const onMouseDown = (e: MouseEvent) => {
+      if (!locked) return;
+      if (e.button === 0) {
+        lmb = true;
+        shoot();
       }
-      // tracer
-      if (tracer) scene.remove(tracer);
-      const g = new THREE.BufferGeometry().setFromPoints([origin, end]);
-      tracer = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xffcc55, transparent: true }));
-      scene.add(tracer);
-      tracerLife = 1;
+      if (e.button === 2) combat.ads = true;
     };
-    const onShootClick = () => {
-      if (document.pointerLockElement === dom) shoot();
+    const onMouseUp = (e: MouseEvent) => {
+      if (e.button === 0) lmb = false;
+      if (e.button === 2) combat.ads = false;
     };
-    dom.addEventListener("mousedown", onShootClick);
+    const onContext = (e: Event) => e.preventDefault();
+    window.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mouseup", onMouseUp);
+    canvasEl.addEventListener("contextmenu", onContext);
 
-    const registerHit = (office: Office, point: THREE.Vector3) => {
-      office.hitFlash = 1;
-      // spark
-      const spark = new THREE.PointLight(0xffffff, 3, 4);
-      spark.position.copy(point);
-      scene.add(spark);
-      setTimeout(() => scene.remove(spark), 80);
-
-      if (office.focused) {
-        // protect the controller agent — bullets bounce off a shield
-        setHint("🛡️ that's the controller agent — it can't be killed");
+    const onKeyDown = (e: KeyboardEvent) => {
+      keys[e.code] = true;
+      // Help/pause toggle works regardless of lock state.
+      if (e.code === "KeyH" || e.code === "Tab") {
+        e.preventDefault();
+        hudData.paused = !hudData.paused;
+        hudDirty = true;
+        if (hudData.paused && locked) document.exitPointerLock();
         return;
       }
-      if (office.hp <= 0 || office.dying) return;
-      office.hp -= 1;
-      office.healthBar.material.map = healthTexture(office.hp, MAX_HP, false);
-      office.healthBar.material.needsUpdate = true;
-      if (office.hp <= 0) killOffice(office);
+      // Combat & traversal only when the game is active (pointer-locked, unpaused).
+      if (!locked || hudData.paused) return;
+      if (e.code === "KeyR") reload();
+      if (e.code === "KeyF" || e.code === "KeyV") melee();
+      if (e.code === "KeyE") interact();
+      if (e.code === "Space" && player.onGround) {
+        player.vel.y = 5.2;
+        player.onGround = false;
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      keys[e.code] = false;
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+
+    const enterGame = () => {
+      initAudio();
+      audioCtx?.resume();
+      hudData.paused = false;
+      hudDirty = true;
+      canvasEl.requestPointerLock();
+    };
+    const enterHandler = () => enterGame();
+    canvasEl.addEventListener("herdr-enter", enterHandler);
+
+    // ── Diff agents → rigs ───────────────────────────────────────────────────
+    const disposeRig = (rig: Rig) => {
+      rig.group.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        const mat = (mesh as THREE.Mesh).material;
+        if (Array.isArray(mat)) mat.forEach((x) => x.dispose());
+      });
+      rig.monitorMat.dispose();
+      (rig.torso.material as THREE.Material).dispose();
+      (rig.armL.material as THREE.Material).dispose();
+      (rig.armR.material as THREE.Material).dispose();
+      (rig.bloom.material as THREE.Material).dispose();
+      if (rig.sign) (rig.sign.material as THREE.Material).dispose();
+      rig.signTex?.dispose();
+      hideBubble(rig);
     };
 
-    const killOffice = (office: Office) => {
-      office.dying = 0.001;
-      office.hitbox.userData.dead = true;
-      setKills((k) => k + 1);
-      setHint(`☠️ killed ${office.label} — closing its herdr pane`);
-      // ACTUALLY kill the agent in herdr
-      herdr.kill(office.paneId).catch(() => {});
+    const syncAgents = (list: Agent[]) => {
+      const seen = new Set<string>();
+      for (const a of list) {
+        const key = keyOf(a);
+        seen.add(key);
+        let rig = rigs.get(key);
+        if (!rig) {
+          const slot = assignSlot(key);
+          if (slot < 0) continue;
+          rig = buildRig(slot, a);
+          rigs.set(key, rig);
+          rig.group.getWorldPosition(scratchV);
+          scratchV.y += 1;
+          const st = STATUS[safeStatus(a.agent_status)];
+          burst(scratchV, st.c, "spark", 8, 3, 0.4);
+          popImpact(scratchV, st.c, 2.5);
+        }
+        rig.head.userData.paneId = a.pane_id;
+        rig.body.userData.paneId = a.pane_id;
+        rig.paneId = a.pane_id;
+        rig.focused = !!a.focused;
+        const nextStatus = safeStatus(a.agent_status);
+        if (rig.status !== nextStatus) {
+          const prev = rig.status;
+          rig.status = nextStatus;
+          const st = STATUS[nextStatus];
+          rig.targetColor.setHex(st.c);
+          rig.targetIntensity = st.i;
+          if (nextStatus === "done" && prev !== "done") {
+            rig.group.getWorldPosition(scratchV);
+            scratchV.y += 2;
+            burst(scratchV, 0x44ff88, "confetti", 16, 4, 0.35);
+            showBubble(rig);
+          }
+          if (nextStatus !== "done") hideBubble(rig);
+        } else if (nextStatus === "done" && !rig.bubble) {
+          showBubble(rig);
+        }
+        const rn = repoName(a);
+        if (rn !== rig.signText && rig.sign) {
+          rig.signText = rn;
+          const { texture, aspect } = makeLabelTexture(rn);
+          (rig.sign.material as THREE.SpriteMaterial).map = texture;
+          rig.signTex?.dispose();
+          rig.signTex = texture;
+          rig.sign.scale.set(1.6, 1.6 / aspect, 1);
+        }
+      }
+      for (const [key, rig] of Array.from(rigs.entries())) {
+        if (!seen.has(key)) {
+          scene.remove(rig.group);
+          disposeRig(rig);
+          rigs.delete(key);
+          usedSlots.delete(rig.slot);
+          slotByKey.delete(key);
+          hitCounts.delete(rig.paneId);
+          killing.delete(rig.paneId);
+          bubbleCache.delete(rig.paneId);
+        }
+      }
     };
 
+    let lastSig = "";
+    const maybeSync = () => {
+      const list = agentsRef.current;
+      const sig = list
+        .map((a) => `${keyOf(a)}:${a.pane_id}:${a.agent_status}:${a.focused}`)
+        .join("|");
+      if (sig !== lastSig) {
+        lastSig = sig;
+        syncAgents(list);
+      }
+    };
+
+    // ── Resize ───────────────────────────────────────────────────────────────
     const onResize = () => {
-      camera.aspect = mount.clientWidth / mount.clientHeight;
+      const w = mount.clientWidth;
+      const h = mount.clientHeight;
+      camera.aspect = w / h;
       camera.updateProjectionMatrix();
-      renderer.setSize(mount.clientWidth, mount.clientHeight);
+      renderer.setSize(w, h);
     };
     window.addEventListener("resize", onResize);
 
-    // ---- loop ----
-    const clock = new THREE.Clock();
-    const forward = new THREE.Vector3();
-    const rightV = new THREE.Vector3();
+    // ── Minimap ──────────────────────────────────────────────────────────────
+    const miniCanvas = document.createElement("canvas");
+    miniCanvas.width = miniCanvas.height = 160;
+    miniCanvas.style.cssText =
+      "position:absolute;right:14px;bottom:14px;width:160px;height:160px;border:2px solid rgba(120,160,220,0.4);border-radius:8px;background:rgba(8,10,20,0.7);pointer-events:none;";
+    mount.appendChild(miniCanvas);
+    const miniCtx = miniCanvas.getContext("2d")!;
+    const drawMini = () => {
+      miniCtx.clearRect(0, 0, 160, 160);
+      const mapX = (x: number) => ((x + halfW) / ROOM_W) * 150 + 5;
+      const mapZ = (z: number) => ((z - minZ) / (maxZ - minZ)) * 150 + 5;
+      rigs.forEach((r) => {
+        r.group.getWorldPosition(scratchV);
+        miniCtx.fillStyle = r.dead ? "#444" : STATUS_HEX[r.status];
+        const px = mapX(scratchV.x);
+        const pz = mapZ(scratchV.z);
+        miniCtx.fillRect(px - 3, pz - 3, 6, 6);
+        if (r.focused) {
+          miniCtx.strokeStyle = "#ffd700";
+          miniCtx.lineWidth = 2;
+          miniCtx.strokeRect(px - 4, pz - 4, 8, 8);
+        }
+      });
+      const px = mapX(player.pos.x);
+      const pz = mapZ(player.pos.z);
+      miniCtx.save();
+      miniCtx.translate(px, pz);
+      miniCtx.rotate(-player.yaw);
+      miniCtx.fillStyle = "#ffffff";
+      miniCtx.beginPath();
+      miniCtx.moveTo(0, -6);
+      miniCtx.lineTo(4, 5);
+      miniCtx.lineTo(-4, 5);
+      miniCtx.closePath();
+      miniCtx.fill();
+      miniCtx.strokeStyle = "rgba(120,200,255,0.5)";
+      miniCtx.beginPath();
+      miniCtx.moveTo(0, 0);
+      miniCtx.lineTo(0, -22);
+      miniCtx.stroke();
+      miniCtx.restore();
+    };
+
+    // ── Main loop ────────────────────────────────────────────────────────────
     let raf = 0;
+    let last = performance.now();
+    let fpsFrames = 0;
+    let fpsTimer = 0;
+    let codeAcc = 0;
+    const ledTmpColor = new THREE.Color();
+    const baseFOV = 72;
+    const camEuler = new THREE.Euler(0, 0, 0, "YXZ");
+
     const tick = () => {
       raf = requestAnimationFrame(tick);
-      const dt = Math.min(clock.getDelta(), 0.05);
-      const t = clock.elapsedTime;
+      const now = performance.now();
+      let dt = (now - last) / 1000;
+      last = now;
+      if (dt > 0.05) dt = 0.05;
 
-      // look
-      camera.rotation.order = "YXZ";
-      camera.rotation.y = yaw;
-      camera.rotation.x = pitch;
+      maybeSync();
 
-      // move (WASD)
-      const speed = (keys.has("ShiftLeft") ? 11 : 6) * dt;
-      forward.set(-Math.sin(yaw), 0, -Math.cos(yaw));
-      rightV.set(Math.cos(yaw), 0, -Math.sin(yaw));
-      if (keys.has("KeyW")) camera.position.addScaledVector(forward, speed);
-      if (keys.has("KeyS")) camera.position.addScaledVector(forward, -speed);
-      if (keys.has("KeyD")) camera.position.addScaledVector(rightV, speed);
-      if (keys.has("KeyA")) camera.position.addScaledVector(rightV, -speed);
-      camera.position.y = 1.7;
-      camera.position.x = Math.max(-12, Math.min(COLS * CELL + 4, camera.position.x));
-      camera.position.z = Math.max(-12, Math.min(Math.ceil(20 / COLS) * CELL + 14, camera.position.z));
+      const paused = hudData.paused || !locked;
 
-      // gun recoil + muzzle decay
-      recoil = Math.max(0, recoil - dt * 6);
-      gun.position.z = recoil * 0.12;
-      gun.rotation.x = recoil * 0.25;
-      muzzle.intensity = Math.max(0, muzzle.intensity - dt * 30);
-      if (tracer) {
-        tracerLife -= dt * 5;
-        (tracer.material as THREE.LineBasicMaterial).opacity = Math.max(0, tracerLife);
-        if (tracerLife <= 0) { scene.remove(tracer); tracer = null; }
+      if (!paused) {
+        player.crouch = !!keys["KeyC"];
+        const speedBase = player.crouch ? 2.2 : 4.4;
+        player.sprint =
+          !!keys["ShiftLeft"] && !player.crouch && player.stamina > 1;
+        let speed = speedBase;
+        if (player.sprint) {
+          speed *= 1.6;
+          player.stamina = Math.max(0, player.stamina - dt * 28);
+        } else {
+          player.stamina = Math.min(100, player.stamina + dt * 16);
+        }
+        const fwd = (keys["KeyW"] ? 1 : 0) - (keys["KeyS"] ? 1 : 0);
+        const str = (keys["KeyD"] ? 1 : 0) - (keys["KeyA"] ? 1 : 0);
+        const sinY = Math.sin(player.yaw);
+        const cosY = Math.cos(player.yaw);
+        const moveX = -sinY * fwd + cosY * str;
+        const moveZ = -cosY * fwd - sinY * str;
+        const mlen = Math.hypot(moveX, moveZ) || 1;
+        const horizSpeed = fwd || str ? speed : 0;
+        player.vel.x = (moveX / mlen) * horizSpeed;
+        player.vel.z = (moveZ / mlen) * horizSpeed;
+
+        player.vel.y -= 14 * dt;
+        player.pos.x += player.vel.x * dt;
+        player.pos.z += player.vel.z * dt;
+        player.pos.y += player.vel.y * dt;
+
+        const eyeH = player.crouch ? CROUCH_EYE : EYE;
+        if (player.pos.y <= eyeH) {
+          player.pos.y = eyeH;
+          player.vel.y = 0;
+          player.onGround = true;
+        }
+
+        const m = 0.6;
+        player.pos.x = Math.max(-halfW + m, Math.min(halfW - m, player.pos.x));
+        player.pos.z = Math.max(minZ + m, Math.min(maxZ - m, player.pos.z));
+
+        const moving = horizSpeed > 0 && player.onGround;
+        if (moving) {
+          player.bob += dt * (player.sprint ? 16 : 11);
+          if (Math.sin(player.bob) > 0.96 && now - player.bobStep > 260) {
+            player.bobStep = now;
+            sfxStep();
+          }
+        } else {
+          player.bob *= 0.9;
+        }
+
+        if (lmb) shoot();
+      } else {
+        player.vel.x = player.vel.z = 0;
       }
 
-      syncOffices(scene);
-      for (const o of officesRef.current.values()) animateOffice(o, t, dt);
-      renderer.render(scene, camera);
-    };
-    tick();
+      if (combat.reloading && now >= combat.reloadEnd) {
+        const need = MAG_SIZE - combat.ammo;
+        const take = Math.min(need, combat.reserve);
+        combat.ammo += take;
+        combat.reserve -= take;
+        combat.reloading = false;
+        pushHud({
+          ammo: combat.ammo,
+          reserve: combat.reserve,
+          reloading: false,
+        });
+      }
 
+      combat.recoil *= Math.pow(0.0001, dt);
+      combat.kick *= Math.pow(0.0001, dt);
+      combat.shake *= Math.pow(0.001, dt);
+
+      if (combat.comboTimer > 0) {
+        combat.comboTimer -= dt;
+        if (combat.comboTimer <= 0 && combat.combo > 1) {
+          combat.combo = 1;
+          pushHud({ combo: 1 });
+        }
+      }
+
+      const bobY = Math.sin(player.bob) * 0.05;
+      const bobX = Math.cos(player.bob * 0.5) * 0.03;
+      camera.position.set(
+        player.pos.x + bobX + (Math.random() - 0.5) * combat.shake * 0.1,
+        player.pos.y + bobY + (Math.random() - 0.5) * combat.shake * 0.1,
+        player.pos.z,
+      );
+      camEuler.set(player.pitch, player.yaw, 0, "YXZ");
+      camera.quaternion.setFromEuler(camEuler);
+
+      const targetFOV = combat.ads ? baseFOV * 0.72 : baseFOV;
+      camera.fov += (targetFOV - camera.fov) * Math.min(1, dt * 12);
+      camera.updateProjectionMatrix();
+      if (combat.ads) exposure.target = 1.25;
+
+      exposure.val += (exposure.target - exposure.val) * Math.min(1, dt * 12);
+      renderer.toneMappingExposure = exposure.val;
+
+      muzzleLight.intensity *= 0.82;
+      (muzzleBloom.material as THREE.SpriteMaterial).opacity *= 0.8;
+
+      codeAcc += dt;
+      if (codeAcc > 0.055) {
+        codeAcc = 0;
+        codeScroll += 3;
+        drawCode();
+      }
+
+      for (let k = 0; k < ledCount; k++) {
+        if (Math.random() < 0.04) {
+          ledTmpColor.setHSL(Math.random(), 0.9, 0.5);
+          ledTmpColor.toArray(ledColors, k * 3);
+        }
+      }
+      (ledInst.instanceColor as THREE.InstancedBufferAttribute).needsUpdate =
+        true;
+
+      const t = now / 1000;
+      rigs.forEach((r) => {
+        r.light.color.lerp(r.targetColor, 0.1);
+        r.light.intensity += (r.targetIntensity - r.light.intensity) * 0.1;
+        r.monitorMat.emissive.lerp(r.targetColor, 0.1);
+        (r.bloom.material as THREE.SpriteMaterial).color.lerp(
+          r.targetColor,
+          0.1,
+        );
+
+        if (r.dead) {
+          r.deathT = Math.max(0, r.deathT - 0.02);
+          r.group.rotation.z = Math.min(Math.PI / 2, r.group.rotation.z + 0.05);
+          r.light.intensity *= 0.9;
+          (r.bloom.material as THREE.SpriteMaterial).opacity *= 0.9;
+          if (r.sign) (r.sign.material as THREE.SpriteMaterial).opacity *= 0.95;
+          return;
+        }
+
+        const flick = 0.8 + 0.4 * Math.sin(t * 22 + r.seed);
+        const bm = r.bloom.material as THREE.SpriteMaterial;
+        switch (r.status) {
+          case "working":
+            r.light.intensity = r.targetIntensity * flick;
+            r.armR.rotation.x = -0.6 + Math.sin(t * 14 + r.seed) * 0.25;
+            r.armL.rotation.x = -0.6 + Math.cos(t * 14 + r.seed) * 0.25;
+            r.torso.rotation.x = 0.05;
+            bm.opacity = 0.5 + 0.2 * Math.sin(t * 22 + r.seed);
+            break;
+          case "idle":
+            r.torso.rotation.x = 0.35;
+            r.armR.rotation.x = -0.2;
+            r.armL.rotation.x = -0.2;
+            bm.opacity = 0.3;
+            break;
+          case "blocked":
+            r.torso.rotation.x = 0.1;
+            r.light.intensity =
+              r.targetIntensity * (0.5 + 0.5 * Math.abs(Math.sin(t * 3)));
+            bm.opacity = 0.4 + 0.4 * Math.abs(Math.sin(t * 3));
+            break;
+          case "done":
+            r.torso.rotation.x = -0.25;
+            r.armR.rotation.x = 0.3;
+            r.armL.rotation.x = 0.3;
+            r.light.intensity =
+              r.targetIntensity * (0.7 + 0.3 * Math.sin(t * 2 + r.seed));
+            bm.opacity = 0.4 + 0.2 * Math.sin(t * 2);
+            if (r.bubble) r.bubble.position.y = 3.0 + Math.sin(t * 2) * 0.05;
+            break;
+          default:
+            bm.opacity = 0.3;
+        }
+      });
+
+      for (const tr of tracers) {
+        if (tr.t > 0) {
+          tr.t -= dt * 8;
+          tr.mat.opacity = Math.max(0, tr.t);
+        }
+      }
+      for (const im of impacts) {
+        if (im.t > 0) {
+          im.t -= dt * 6;
+          im.light.intensity = Math.max(0, im.t * 3);
+        }
+      }
+      for (const pt of particles) {
+        if (pt.t > 0) {
+          pt.t -= dt * (pt.kind === "confetti" ? 1.2 : 2.4);
+          pt.vel.y += pt.grav * dt;
+          pt.sprite.position.addScaledVector(pt.vel, dt);
+          const mat = pt.sprite.material as THREE.SpriteMaterial;
+          if (pt.kind === "ring") {
+            pt.sprite.scale.setScalar(1.2 + (1 - pt.t) * 2);
+          }
+          mat.opacity = Math.max(0, pt.t);
+          if (pt.t <= 0) pt.sprite.visible = false;
+        }
+      }
+      for (const sh of shells) {
+        if (sh.t > 0) {
+          sh.t -= dt;
+          sh.vel.y -= 18 * dt;
+          sh.mesh.position.addScaledVector(sh.vel, dt);
+          sh.mesh.rotation.x += sh.av.x * dt;
+          sh.mesh.rotation.y += sh.av.y * dt;
+          if (sh.mesh.position.y < 0.03) {
+            sh.mesh.position.y = 0.03;
+            sh.vel.set(0, 0, 0);
+          }
+          if (sh.t <= 0) sh.mesh.visible = false;
+        }
+      }
+
+      for (const pk of pickups) {
+        if (pk.active) {
+          pk.mesh.rotation.y += dt * 2;
+          pk.mesh.position.y = pk.basePos.y + Math.sin(t * 3) * 0.08;
+          const d = Math.hypot(
+            player.pos.x - pk.basePos.x,
+            player.pos.z - pk.basePos.z,
+          );
+          if (d < 1.2) {
+            pk.active = false;
+            pk.mesh.visible = false;
+            pk.bloom.visible = false;
+            pk.respawn = now + 12000;
+            combat.reserve = Math.min(RESERVE_MAX, combat.reserve + 24);
+            player.health = Math.min(100, player.health + 20);
+            sfxPickup();
+            burst(pk.basePos, 0x88ccff, "spark", 8, 3, 0.3);
+            pushHud({ reserve: combat.reserve, health: player.health });
+          }
+        } else if (now >= pk.respawn) {
+          pk.active = true;
+          pk.mesh.visible = true;
+          pk.bloom.visible = true;
+        }
+      }
+
+      for (const b of panelBlooms) {
+        (b.material as THREE.SpriteMaterial).opacity =
+          0.28 + 0.04 * Math.sin(t * 5);
+      }
+      (neonBloom.material as THREE.SpriteMaterial).opacity =
+        0.45 + 0.1 * Math.sin(t * 3);
+
+      const liveSpread =
+        6 +
+        combat.recoil * 30 +
+        (player.vel.lengthSq() > 0.2 ? 8 : 0) +
+        (combat.ads ? -4 : 0);
+
+      fpsFrames++;
+      fpsTimer += dt;
+      if (fpsTimer >= 0.5) {
+        pushHud({ fps: Math.round(fpsFrames / fpsTimer) });
+        fpsFrames = 0;
+        fpsTimer = 0;
+      }
+
+      pushHud({
+        stamina: Math.round(player.stamina),
+        health: Math.round(player.health),
+        spread: Math.max(2, liveSpread),
+      });
+
+      drawMini();
+      renderer.render(scene, camera);
+
+      if (hudDirty) {
+        hudDirty = false;
+        const snapshot: HudState = {
+          health: hudData.health,
+          stamina: hudData.stamina,
+          ammo: hudData.ammo,
+          reserve: hudData.reserve,
+          reloading: hudData.reloading,
+          score: hudData.score,
+          combo: hudData.combo,
+          killfeed: hudData.killfeed,
+          objective: hudData.objective,
+          fps: hudData.fps,
+          hitmarker: hudData.hitmarker,
+          headshot: hudData.headshot,
+          damageFlash: hudData.damageFlash,
+          killFlash: hudData.killFlash,
+          shieldHint: hudData.shieldHint,
+          paused: hudData.paused,
+          locked: hudData.locked,
+          connected: hudData.connected,
+          error: hudData.error,
+          highScore: hudData.highScore,
+          spread: hudData.spread,
+        };
+        setHud((prev) => ({
+          ...snapshot,
+          connected: prev.connected,
+          error: prev.error,
+        }));
+      }
+    };
+    raf = requestAnimationFrame(tick);
+
+    // ── Teardown ─────────────────────────────────────────────────────────────
     return () => {
       cancelAnimationFrame(raf);
+      window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("resize", onResize);
-      document.removeEventListener("mousemove", onMouseMove);
       document.removeEventListener("pointerlockchange", onLockChange);
-      dom.removeEventListener("click", onClickCanvas);
-      dom.removeEventListener("mousedown", onShootClick);
+      canvasEl.removeEventListener("contextmenu", onContext);
+      canvasEl.removeEventListener("herdr-enter", enterHandler);
+      if (document.pointerLockElement === canvasEl) document.exitPointerLock();
+
+      rigs.forEach((r) => disposeRig(r));
+      rigs.clear();
+
+      scene.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (mesh.geometry) mesh.geometry.dispose();
+      });
+      [
+        deskTopGeo,
+        deskLegGeo,
+        monitorGeo,
+        monitorStandGeo,
+        headGeo,
+        torsoGeo,
+        armGeo,
+        bodyHitGeo,
+        headHitGeo,
+        mugGeo,
+        paperGeo,
+        seatGeo,
+        seatBackGeo,
+        poleGeo,
+        shellGeo2,
+        potGeo,
+        leafGeo,
+        rackGeo,
+        ledGeo,
+        partGeo,
+        panelGeo,
+        wbGeo,
+        shellGeo,
+        ceilGeo,
+        backWallGeo,
+        neonGeo,
+        gunBodyGeo,
+        gunBarrelGeo,
+        floor.geometry,
+      ].forEach((g) => g.dispose());
+      tracers.forEach((tr) => {
+        tr.line.geometry.dispose();
+        tr.mat.dispose();
+      });
+      particles.forEach((p) =>
+        (p.sprite.material as THREE.Material).dispose(),
+      );
+      disposables.forEach((d) => d.dispose());
+      bloomMat.dispose();
+
       renderer.dispose();
-      mount.removeChild(renderer.domElement);
+      if (miniCanvas.parentElement) miniCanvas.remove();
+      if (renderer.domElement.parentElement) renderer.domElement.remove();
+
+      try {
+        ambientOsc?.stop();
+      } catch {
+        /* ignore */
+      }
+      audioCtx?.close().catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function buildOffice(slot: number): Office {
-    const col = slot % COLS;
-    const row = Math.floor(slot / COLS);
-    const baseX = col * CELL;
-    const baseZ = -row * CELL;
-
-    const group = new THREE.Group();
-    group.position.set(baseX, 0, baseZ);
-
-    const tile = new THREE.Mesh(
-      new THREE.BoxGeometry(CELL - 0.6, 0.1, CELL - 0.6),
-      new THREE.MeshStandardMaterial({ color: 0x1e1e2a, roughness: 0.9 }),
-    );
-    tile.position.y = 0.05;
-    tile.receiveShadow = true;
-    group.add(tile);
-
-    const wallMat = new THREE.MeshStandardMaterial({ color: 0x2b2b3a, roughness: 0.8 });
-    const back = new THREE.Mesh(new THREE.BoxGeometry(CELL - 0.6, 2.4, 0.18), wallMat);
-    back.position.set(0, 1.2, -(CELL - 0.6) / 2);
-    back.castShadow = back.receiveShadow = true;
-    group.add(back);
-    const side = new THREE.Mesh(new THREE.BoxGeometry(0.18, 2.4, CELL - 0.6), wallMat);
-    side.position.set(-(CELL - 0.6) / 2, 1.2, 0);
-    side.castShadow = true;
-    group.add(side);
-
-    const deskMat = new THREE.MeshStandardMaterial({ color: 0x6b4f3a, roughness: 0.6 });
-    const desk = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.18, 1.6), deskMat);
-    desk.position.set(0, 1.1, -1.4);
-    desk.castShadow = desk.receiveShadow = true;
-    group.add(desk);
-    for (const sx of [-1.5, 1.5]) {
-      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.16, 1.1, 0.16), deskMat);
-      leg.position.set(sx, 0.55, -1.4);
-      group.add(leg);
-    }
-
-    const screenMat = new THREE.MeshStandardMaterial({
-      color: 0x0a0a0a, emissive: 0x2266ff, emissiveIntensity: 0.4,
-    });
-    const screen = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.95, 0.08), screenMat);
-    screen.position.set(0, 1.95, -1.85);
-    screen.castShadow = true;
-    group.add(screen);
-    const stand = new THREE.Mesh(
-      new THREE.BoxGeometry(0.12, 0.5, 0.12),
-      new THREE.MeshStandardMaterial({ color: 0x111118 }),
-    );
-    stand.position.set(0, 1.45, -1.85);
-    group.add(stand);
-
-    const chair = new THREE.Group();
-    const chairMat = new THREE.MeshStandardMaterial({ color: 0x18181f, roughness: 0.7 });
-    const seat = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.18, 1.1), chairMat);
-    seat.position.y = 0.95;
-    const cback = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1.0, 0.16), chairMat);
-    cback.position.set(0, 1.5, 0.5);
-    chair.add(seat, cback);
-    chair.position.set(0, 0, 0.2);
-    chair.castShadow = true;
-    group.add(chair);
-
-    const character = new THREE.Group();
-    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x3b82f6, roughness: 0.5 });
-    const skinMat = new THREE.MeshStandardMaterial({ color: 0xf2c79b, roughness: 0.6 });
-    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.42, 0.7, 6, 12), bodyMat);
-    body.position.y = 1.55;
-    body.castShadow = true;
-    character.add(body);
-
-    const head = new THREE.Group();
-    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.34, 20, 20), skinMat);
-    skull.castShadow = true;
-    head.add(skull);
-    const eyeMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
-    for (const ex of [-0.12, 0.12]) {
-      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 8), eyeMat);
-      eye.position.set(ex, 0.04, 0.3);
-      head.add(eye);
-    }
-    head.position.y = 2.25;
-    character.add(head);
-
-    const armGeo = new THREE.CapsuleGeometry(0.11, 0.5, 4, 8);
-    const mkArm = (sx: number) => {
-      const pivot = new THREE.Group();
-      pivot.position.set(sx, 1.85, 0);
-      const arm = new THREE.Mesh(armGeo, bodyMat);
-      arm.position.set(0, -0.3, 0.05);
-      arm.castShadow = true;
-      pivot.add(arm);
-      character.add(pivot);
-      return pivot;
-    };
-    const leftArm = mkArm(-0.46);
-    const rightArm = mkArm(0.46);
-    character.position.set(0, 0, 0.1);
-    group.add(character);
-
-    // hitbox (invisible) used for raycasting
-    const hitbox = new THREE.Mesh(
-      new THREE.BoxGeometry(1.1, 2.4, 1.0),
-      new THREE.MeshBasicMaterial({ visible: false }),
-    );
-    hitbox.position.set(0, 1.5, 0.1);
-    hitbox.userData.officeId = `slot-${slot}`;
-    character.add(hitbox);
-    hitboxesRef.current.push(hitbox);
-
-    const iconSprite = makeSprite(emojiTexture("·"));
-    iconSprite.scale.set(0.9, 0.9, 0.9);
-    iconSprite.position.set(0, 3.15, 0);
-    group.add(iconSprite);
-
-    const healthBar = makeSprite(healthTexture(MAX_HP, MAX_HP, false));
-    healthBar.scale.set(1.6, 0.28, 1);
-    healthBar.position.set(0, 2.75, 0);
-    group.add(healthBar);
-
-    sceneRef.current!.add(group);
-
-    return {
-      group, character, leftArm, rightArm, head, body, screenMat, bodyMat, chair,
-      hitbox, healthBar, signSprite: null, iconSprite, bubbleSprite: null,
-      baseX, baseZ, status: "unknown", present: false, focused: false, paneId: "",
-      label: "", hp: MAX_HP, dying: 0, hitFlash: 0,
-      bubbleText: null, bubbleFetchedFor: null, phase: Math.random() * Math.PI * 2,
-    };
-  }
-
-  function syncOffices(scene: THREE.Scene) {
-    const byOffice = new Map<string, Agent>();
-    for (const a of agentsRef.current) byOffice.set(a.workspace_id || a.pane_id, a);
-
-    for (const id of byOffice.keys()) {
-      if (!slotRef.current.has(id)) slotRef.current.set(id, slotRef.current.size);
-      if (!officesRef.current.has(id)) {
-        const office = buildOffice(slotRef.current.get(id)!);
-        office.hitbox.userData.officeId = id;
-        officesRef.current.set(id, office);
-      }
-    }
-
-    for (const [id, office] of officesRef.current) {
-      const a = byOffice.get(id);
-      const present = !!a && a.agent_status !== "unknown" && !office.dying;
-      office.present = present;
-      office.hitbox.userData.present = present;
-      office.status = a?.agent_status ?? "unknown";
-      office.focused = !!a?.focused;
-      if (a) { office.paneId = a.pane_id; office.label = repoName(a); }
-
-      // agent came back / new agent -> reset hp
-      if (present && office.hp <= 0 && !office.dying) {
-        office.hp = MAX_HP;
-        office.healthBar.material.map = healthTexture(MAX_HP, MAX_HP, false);
-        office.healthBar.material.needsUpdate = true;
-        office.hitbox.userData.dead = false;
-      }
-
-      if (present && !office.signSprite) {
-        const { texture, aspect } = makeLabelTexture(office.label, {
-          bg: "#1e293b", border: "#475569", color: "#e2e8f0", size: 52,
-        });
-        const s = makeSprite(texture);
-        s.scale.set(3.2, 3.2 / aspect, 1);
-        s.position.set(0, 4.0, -(CELL - 0.6) / 2 + 0.2);
-        office.signSprite = s;
-        office.group.add(s);
-      }
-      if (office.signSprite) office.signSprite.visible = present;
-
-      office.character.visible = present || office.dying > 0;
-      office.iconSprite.visible = present;
-      office.healthBar.visible = present;
-      if (present) {
-        office.bodyMat.color.setHex(STATUS_COLOR[office.status]);
-        const want = STATUS_ICON[office.status];
-        if (office.iconSprite.userData.emoji !== want) {
-          office.iconSprite.userData.emoji = want;
-          office.iconSprite.material.map = emojiTexture(want);
-          office.iconSprite.material.needsUpdate = true;
-        }
-      }
-      office.chair.position.z = present || office.dying ? 0.2 : -0.6;
-
-      if (present && office.status === "done" && a) {
-        if (office.bubbleFetchedFor !== a.pane_id) {
-          office.bubbleFetchedFor = a.pane_id;
-          herdr.bubble(a.pane_id)
-            .then((r) => {
-              office.bubbleText = r.message || "done ✓";
-              if (office.bubbleSprite) { office.group.remove(office.bubbleSprite); office.bubbleSprite = null; }
-            })
-            .catch(() => { office.bubbleText = "done ✓"; });
-        }
-        if (office.bubbleText && !office.bubbleSprite) {
-          const rtl = isHebrew(office.bubbleText);
-          const { texture, aspect } = makeLabelTexture(office.bubbleText, {
-            bg: "#fffbea", border: "#10b981", color: "#0a0a0a", size: 38, width: 560, rtl,
-          });
-          const s = makeSprite(texture);
-          const h = 4.0 / aspect;
-          s.scale.set(4.0, h, 1);
-          s.position.set(1.7, 3.5 + h / 2, 0.4);
-          office.bubbleSprite = s;
-          office.group.add(s);
-        }
-      } else if (office.bubbleSprite) {
-        office.group.remove(office.bubbleSprite);
-        office.bubbleSprite = null;
-        office.bubbleText = null;
-        office.bubbleFetchedFor = null;
-      }
-    }
-  }
-
-  function animateOffice(o: Office, t: number, dt: number) {
-    // death animation: collapse forward
-    if (o.dying > 0) {
-      o.dying = Math.min(1, o.dying + dt * 1.2);
-      o.character.rotation.x = -o.dying * (Math.PI / 2);
-      o.character.position.y = -o.dying * 0.3;
-      (o.bodyMat as THREE.MeshStandardMaterial).color.lerpColors(
-        new THREE.Color(0x7f1d1d), new THREE.Color(0x111111), o.dying,
-      );
-      if (o.dying >= 1) {
-        o.character.visible = false;
-        o.dying = 0;
-        o.character.rotation.x = 0;
-        o.character.position.y = 0;
-      }
-      return;
-    }
-    if (!o.present) { o.screenMat.emissiveIntensity = 0.04; return; }
-
-    // hit flash
-    if (o.hitFlash > 0) {
-      o.hitFlash = Math.max(0, o.hitFlash - dt * 4);
-      o.bodyMat.emissive.setHex(0xff3333);
-      o.bodyMat.emissiveIntensity = o.hitFlash;
-    } else {
-      o.bodyMat.emissiveIntensity = 0;
-    }
-
-    const p = o.phase;
-    o.group.position.x = o.baseX;
-    o.character.rotation.z = 0;
-    o.head.rotation.x = 0;
-    o.body.rotation.x = 0;
-
-    switch (o.status) {
-      case "working":
-        o.leftArm.rotation.x = -1.15 + Math.sin(t * 12 + p) * 0.4;
-        o.rightArm.rotation.x = -1.15 + Math.sin(t * 12 + p + Math.PI) * 0.4;
-        o.head.position.y = 2.25 + Math.sin(t * 6 + p) * 0.03;
-        o.body.rotation.x = 0.16;
-        o.screenMat.emissive.setHex(0x2266ff);
-        o.screenMat.emissiveIntensity = 0.7 + Math.sin(t * 9 + p) * 0.25;
-        break;
-      case "idle":
-        o.leftArm.rotation.x = -0.1;
-        o.rightArm.rotation.x = -0.1;
-        o.character.rotation.z = Math.sin(t * 1.1 + p) * 0.06;
-        o.head.rotation.x = 0.35 + Math.sin(t * 0.8 + p) * 0.05;
-        o.screenMat.emissive.setHex(0x223344);
-        o.screenMat.emissiveIntensity = 0.15;
-        break;
-      case "blocked":
-        o.leftArm.rotation.x = -1.6;
-        o.rightArm.rotation.x = -1.6;
-        o.group.position.x = o.baseX + Math.sin(t * 26 + p) * 0.025;
-        o.screenMat.emissive.setHex(0xff5533);
-        o.screenMat.emissiveIntensity = 0.5 + Math.sin(t * 14) * 0.3;
-        break;
-      case "done":
-        o.leftArm.rotation.x = -0.2;
-        o.rightArm.rotation.x = -0.2;
-        o.body.rotation.x = -0.12;
-        o.head.position.y = 2.25 + Math.sin(t * 2 + p) * 0.02;
-        o.screenMat.emissive.setHex(0x10b981);
-        o.screenMat.emissiveIntensity = 0.4;
-        break;
-    }
-    o.iconSprite.position.y = 3.15 + Math.sin(t * 2 + p) * 0.12;
-    // health bar shield tint for the protected controller agent
-    if (o.focused) {
-      o.healthBar.material.map = healthTexture(o.hp, MAX_HP, true);
-      o.healthBar.material.needsUpdate = true;
-    }
-  }
-
-  useEffect(() => {
-    if (!hint) return;
-    const t = setTimeout(() => setHint(null), 2500);
-    return () => clearTimeout(t);
-  }, [hint]);
+  const lowAmmo = hud.ammo <= 3;
+  const enterCanvas = () => {
+    const c = mountRef.current?.querySelector("canvas");
+    c?.dispatchEvent(new Event("herdr-enter"));
+  };
+  const recent = (ts: number, ms: number) => Date.now() - ts < ms;
 
   return (
-    <div className="relative h-full w-full overflow-hidden">
-      <div ref={mountRef} className="h-full w-full cursor-none" />
+    <div
+      ref={mountRef}
+      style={{
+        position: "fixed",
+        inset: 0,
+        width: "100vw",
+        height: "100vh",
+        overflow: "hidden",
+        background: "#05060d",
+        cursor: hud.locked ? "none" : "default",
+        fontFamily: "ui-sans-serif, system-ui, sans-serif",
+        userSelect: "none",
+      }}
+    >
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          pointerEvents: "none",
+          boxShadow: "inset 0 0 220px 60px rgba(0,0,0,0.75)",
+          transition: "background 0.1s",
+          background: recent(hud.killFlash, 140)
+            ? "rgba(255,255,255,0.18)"
+            : recent(hud.damageFlash, 200)
+              ? "rgba(255,0,0,0.22)"
+              : "transparent",
+        }}
+      />
 
-      {/* crosshair */}
-      {locked && (
-        <div className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
-          <div className="relative h-6 w-6">
-            <span className="absolute left-1/2 top-0 h-2 w-px -translate-x-1/2 bg-white/80" />
-            <span className="absolute bottom-0 left-1/2 h-2 w-px -translate-x-1/2 bg-white/80" />
-            <span className="absolute top-1/2 left-0 h-px w-2 -translate-y-1/2 bg-white/80" />
-            <span className="absolute top-1/2 right-0 h-px w-2 -translate-y-1/2 bg-white/80" />
-            <span className="absolute left-1/2 top-1/2 size-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-red-500" />
-          </div>
+      {hud.locked && !hud.paused && (
+        <div
+          style={{
+            position: "absolute",
+            left: "50%",
+            top: "50%",
+            transform: "translate(-50%,-50%)",
+            pointerEvents: "none",
+          }}
+        >
+          {[
+            { w: 2, h: 8, x: 0, y: -(hud.spread + 8) },
+            { w: 2, h: 8, x: 0, y: hud.spread },
+            { w: 8, h: 2, x: -(hud.spread + 8), y: 0 },
+            { w: 8, h: 2, x: hud.spread, y: 0 },
+          ].map((c, i) => (
+            <span
+              key={i}
+              style={{
+                position: "absolute",
+                width: c.w,
+                height: c.h,
+                left: c.x,
+                top: c.y,
+                background: "rgba(180,255,210,0.9)",
+                boxShadow: "0 0 4px rgba(120,255,180,0.8)",
+              }}
+            />
+          ))}
+          {recent(hud.hitmarker, 140) && (
+            <span
+              style={{
+                position: "absolute",
+                left: -10,
+                top: -10,
+                width: 20,
+                height: 20,
+                color: hud.headshot ? "#ff4444" : "#fff",
+                fontWeight: 900,
+                fontSize: 18,
+                lineHeight: "20px",
+                textAlign: "center",
+              }}
+            >
+              x
+            </span>
+          )}
         </div>
       )}
 
-      {/* HUD */}
-      <div className="pointer-events-none absolute left-4 top-4 rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-300 backdrop-blur">
-        <div className="font-semibold text-zinc-100">🔫 herdr office — agent hunt</div>
-        <div className="mt-1 text-zinc-400">
-          {agents.length} desks · <span className={connected ? "text-emerald-400" : "text-amber-400"}>{connected ? "live" : "polling"}</span> · kills: <span className="text-red-400">{kills}</span>
+      <div
+        style={{
+          position: "absolute",
+          left: 16,
+          top: 14,
+          color: "#dbeafe",
+          textShadow: "0 1px 4px #000",
+          pointerEvents: "none",
+        }}
+      >
+        <div style={{ fontSize: 26, fontWeight: 800 }}>
+          {hud.score.toLocaleString()}
+          {hud.combo > 1 && (
+            <span style={{ color: "#ffd700", marginLeft: 10, fontSize: 18 }}>
+              x{hud.combo}
+            </span>
+          )}
         </div>
-        <div className="mt-1 text-[10px] text-zinc-500">WASD move · mouse aim · click shoot · 3 hits = real kill</div>
+        <div style={{ fontSize: 12, opacity: 0.7 }}>
+          high {hud.highScore.toLocaleString()}
+        </div>
+        <div style={{ fontSize: 13, marginTop: 6, opacity: 0.85, maxWidth: 320 }}>
+          {hud.objective}
+        </div>
       </div>
 
-      {hint && (
-        <div className="pointer-events-none absolute left-1/2 top-20 -translate-x-1/2 rounded-md bg-zinc-950/85 px-4 py-2 text-sm text-zinc-100 shadow-lg backdrop-blur">
-          {hint}
+      <div
+        style={{
+          position: "absolute",
+          right: 16,
+          top: 14,
+          color: "#cbd5e1",
+          textAlign: "right",
+          fontSize: 12,
+          textShadow: "0 1px 3px #000",
+          pointerEvents: "none",
+        }}
+      >
+        <div style={{ fontWeight: 700 }}>{hud.fps} FPS</div>
+        <div
+          style={{ color: hud.connected ? "#4ade80" : "#fbbf24", marginTop: 2 }}
+        >
+          {hud.connected ? "live" : "polling"}
+        </div>
+        {hud.error && (
+          <div style={{ color: "#f87171", maxWidth: 220 }}>{hud.error}</div>
+        )}
+        <div style={{ marginTop: 8, display: "grid", gap: 3 }}>
+          {(["working", "idle", "blocked", "done"] as AgentStatus[]).map((s) => (
+            <div
+              key={s}
+              style={{
+                display: "flex",
+                gap: 6,
+                alignItems: "center",
+                justifyContent: "flex-end",
+              }}
+            >
+              <span style={{ opacity: 0.8 }}>{s}</span>
+              <span
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: 2,
+                  background: STATUS_HEX[s],
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div
+        style={{
+          position: "absolute",
+          right: 16,
+          top: 150,
+          display: "flex",
+          flexDirection: "column",
+          gap: 4,
+          alignItems: "flex-end",
+          pointerEvents: "none",
+        }}
+      >
+        {hud.killfeed.map((k) => (
+          <div
+            key={k.id}
+            style={{
+              color: k.color,
+              fontSize: 13,
+              fontWeight: 700,
+              textShadow: "0 1px 3px #000",
+              background: "rgba(0,0,0,0.35)",
+              padding: "2px 8px",
+              borderRadius: 4,
+            }}
+          >
+            {k.text}
+          </div>
+        ))}
+      </div>
+
+      <div
+        style={{
+          position: "absolute",
+          left: 16,
+          bottom: 16,
+          color: "#e2e8f0",
+          pointerEvents: "none",
+          width: 220,
+        }}
+      >
+        <Bar label="HP" value={hud.health} color="#ef4444" />
+        <Bar label="STA" value={hud.stamina} color="#22d3ee" />
+        <div
+          style={{
+            marginTop: 8,
+            fontSize: 30,
+            fontWeight: 900,
+            color: lowAmmo ? "#ff4444" : "#fff",
+            textShadow: "0 1px 4px #000",
+            animation: lowAmmo ? "herdrpulse 0.6s infinite" : undefined,
+          }}
+        >
+          {hud.reloading ? "RELOADING" : `${hud.ammo}`}
+          <span style={{ fontSize: 16, opacity: 0.6 }}> / {hud.reserve}</span>
+        </div>
+      </div>
+
+      {recent(hud.shieldHint, 900) && (
+        <div
+          style={{
+            position: "absolute",
+            left: "50%",
+            top: "58%",
+            transform: "translateX(-50%)",
+            color: "#7dd3fc",
+            fontWeight: 800,
+            fontSize: 18,
+            textShadow: "0 0 8px #0891b2",
+            pointerEvents: "none",
+          }}
+        >
+          shielded — controller agent protected
         </div>
       )}
 
-      {!locked && (
+      {!hud.locked && !hud.paused && (
         <div
-          className="absolute inset-0 grid cursor-pointer place-items-center bg-zinc-950/60 backdrop-blur-sm"
-          onClick={() => mountRef.current?.querySelector("canvas")?.dispatchEvent(new MouseEvent("click"))}
+          onClick={enterCanvas}
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(5,7,16,0.78)",
+            color: "#e2e8f0",
+            cursor: "pointer",
+            textAlign: "center",
+            gap: 14,
+          }}
         >
-          <div className="text-center">
-            <div className="text-2xl font-bold text-zinc-100">🔫 click to enter the office</div>
-            <div className="mt-2 text-sm text-zinc-400">
-              WASD to move · mouse to aim · click to shoot
-            </div>
-            <div className="mt-1 text-xs text-amber-400">
-              shooting an agent 3× actually closes its herdr pane — for real
-            </div>
-            <div className="mt-3 text-[11px] text-zinc-500">press Esc to release the mouse</div>
+          <div style={{ fontSize: 40, fontWeight: 900, color: "#7dd3fc" }}>
+            herdr · night office
+          </div>
+          <div style={{ fontSize: 18, opacity: 0.9 }}>click to enter</div>
+          <div style={{ fontSize: 13, opacity: 0.6, maxWidth: 480 }}>
+            WASD move · Mouse look · LMB shoot · RMB aim · R reload · Space jump ·
+            Shift sprint · C crouch · F/V melee · E focus/interact · H help
+          </div>
+          <div style={{ fontSize: 12, opacity: 0.5 }}>
+            3 hits eliminate an agent (real kill). The focused controller agent is
+            shield-protected.
           </div>
         </div>
       )}
+
+      {hud.paused && (
+        <div
+          onClick={enterCanvas}
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(5,7,16,0.85)",
+            color: "#e2e8f0",
+            cursor: "pointer",
+            gap: 8,
+          }}
+        >
+          <div style={{ fontSize: 30, fontWeight: 800, color: "#7dd3fc" }}>
+            paused
+          </div>
+          <div style={{ display: "grid", gap: 4, fontSize: 14, opacity: 0.9 }}>
+            <span>Move — WASD</span>
+            <span>Look — Mouse</span>
+            <span>Shoot — LMB · Aim — RMB</span>
+            <span>Reload — R</span>
+            <span>Jump — Space · Sprint — Shift · Crouch — C</span>
+            <span>Melee — F / V</span>
+            <span>Interact / Focus — E</span>
+            <span>Help / Pause — H or Tab</span>
+          </div>
+          <div style={{ fontSize: 13, opacity: 0.6, marginTop: 8 }}>
+            {hud.connected ? "live feed" : "polling feed"}
+            {hud.error ? ` · ${hud.error}` : ""}
+          </div>
+          <div
+            style={{
+              fontSize: 12,
+              opacity: 0.55,
+              maxWidth: 420,
+              textAlign: "center",
+            }}
+          >
+            The shield protects the focused controller agent — it can never be
+            killed.
+          </div>
+          <div style={{ fontSize: 14, marginTop: 10, color: "#7dd3fc" }}>
+            click to resume
+          </div>
+        </div>
+      )}
+
+      <style>{`@keyframes herdrpulse{0%,100%{opacity:1}50%{opacity:0.35}}`}</style>
+    </div>
+  );
+}
+
+function Bar({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: number;
+  color: string;
+}) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+      <span
+        style={{
+          fontSize: 11,
+          width: 28,
+          color: "#94a3b8",
+          textShadow: "0 1px 2px #000",
+        }}
+      >
+        {label}
+      </span>
+      <div
+        style={{
+          flex: 1,
+          height: 8,
+          background: "rgba(255,255,255,0.12)",
+          borderRadius: 4,
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            width: `${Math.max(0, Math.min(100, value))}%`,
+            height: "100%",
+            background: color,
+            transition: "width 0.15s",
+          }}
+        />
+      </div>
     </div>
   );
 }
