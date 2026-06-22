@@ -48,11 +48,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# This API can drive agents that run arbitrary shell commands, so we do NOT use
+# wildcard CORS. Only same-machine dashboard origins may call it from a browser.
+# Override/extend with HERDR_ALLOWED_ORIGINS (comma-separated).
+_default_origins = [
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:3939", "http://127.0.0.1:3939",
+]
+_env_origins = [o.strip() for o in os.environ.get("HERDR_ALLOWED_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_env_origins or _default_origins,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Token"],
 )
 
 
