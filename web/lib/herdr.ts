@@ -1,7 +1,7 @@
-// Client for the herdr-controller FastAPI backend.
-
-export const API_BASE =
-  process.env.NEXT_PUBLIC_HERDR_API ?? "http://127.0.0.1:8791";
+// Client for the herdr-controller API — served same-origin by Next.js route
+// handlers under /api (which shell out to the `herdr` CLI). Override the base
+// only if you proxy the API elsewhere.
+export const API_BASE = process.env.NEXT_PUBLIC_HERDR_API ?? "";
 
 export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 
@@ -49,27 +49,27 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const herdr = {
-  summary: () => req<Summary>("/summary"),
-  agents: () => req<{ agents: Agent[]; count: number }>("/agents"),
+  summary: () => req<Summary>("/api/summary"),
+  agents: () => req<{ agents: Agent[]; count: number }>("/api/agents"),
   read: (target: string, lines = 200) =>
-    req<string>(`/agents/${encodeURIComponent(target)}/read?lines=${lines}`),
+    req<string>(`/api/agents/${encodeURIComponent(target)}/read?lines=${lines}`),
   bubble: (target: string) =>
     req<{ target: string; message: string }>(
-      `/agents/${encodeURIComponent(target)}/bubble`,
+      `/api/agents/${encodeURIComponent(target)}/bubble`,
     ),
   send: (target: string, text: string, enter: boolean) =>
-    req(`/agents/${encodeURIComponent(target)}/send`, {
+    req(`/api/agents/${encodeURIComponent(target)}/send`, {
       method: "POST",
       body: JSON.stringify({ text, enter }),
     }),
   focus: (target: string) =>
-    req(`/agents/${encodeURIComponent(target)}/focus`, { method: "POST" }),
+    req(`/api/agents/${encodeURIComponent(target)}/focus`, { method: "POST" }),
   start: (body: Record<string, unknown>) =>
-    req("/agents/start", { method: "POST", body: JSON.stringify(body) }),
+    req("/api/agents/start", { method: "POST", body: JSON.stringify(body) }),
   // Closes the agent's pane in herdr — i.e. actually kills the agent.
   kill: (paneId: string) =>
-    req(`/panes/${encodeURIComponent(paneId)}`, { method: "DELETE" }),
-  streamUrl: () => `${API_BASE}/agents/stream`,
+    req(`/api/panes/${encodeURIComponent(paneId)}`, { method: "DELETE" }),
+  streamUrl: () => `${API_BASE}/api/agents/stream`,
 };
 
 export const STATUS_META: Record<
