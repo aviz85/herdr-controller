@@ -181,7 +181,7 @@ export function OfficeScene() {
     mount.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x0a0a18, 0.018);
+    scene.fog = new THREE.FogExp2(0x12141f, 0.011);
 
     const camera = new THREE.PerspectiveCamera(
       72,
@@ -219,14 +219,14 @@ export function OfficeScene() {
       const c = document.createElement("canvas");
       c.width = c.height = 256;
       const ctx = c.getContext("2d")!;
-      ctx.fillStyle = "#15182a";
+      ctx.fillStyle = "#2a2f48";
       ctx.fillRect(0, 0, 256, 256);
       for (let i = 0; i < 5000; i++) {
-        const v = 18 + Math.random() * 26;
-        ctx.fillStyle = `rgb(${v * 0.7},${v * 0.8},${v + 12})`;
+        const v = 40 + Math.random() * 34;
+        ctx.fillStyle = `rgb(${v * 0.75},${v * 0.82},${v + 14})`;
         ctx.fillRect(Math.random() * 256, Math.random() * 256, 2, 2);
       }
-      ctx.strokeStyle = "rgba(80,110,160,0.10)";
+      ctx.strokeStyle = "rgba(110,140,190,0.12)";
       ctx.lineWidth = 1;
       for (let i = 0; i <= 256; i += 32) {
         ctx.beginPath();
@@ -336,6 +336,48 @@ export function OfficeScene() {
       ctx.shadowBlur = 12;
       ctx.fillStyle = "#ecfeff";
       ctx.fillText("herdr", 512, 138);
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }
+
+    function posterTexture(
+      bg: string,
+      accent: string,
+      title: string,
+      sub: string,
+    ): THREE.CanvasTexture {
+      const c = document.createElement("canvas");
+      c.width = 512;
+      c.height = 768;
+      const ctx = c.getContext("2d")!;
+      const g = ctx.createLinearGradient(0, 0, 0, 768);
+      g.addColorStop(0, bg);
+      g.addColorStop(1, "#0b0d18");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 512, 768);
+      // accent geometry
+      ctx.fillStyle = accent;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.arc(256, 300, 150, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "#0b0d18";
+      ctx.beginPath();
+      ctx.arc(256, 300, 110, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = accent;
+      ctx.font = "bold 90px ui-sans-serif, system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(title, 256, 300);
+      ctx.fillStyle = "#e8ecf6";
+      ctx.font = "bold 48px ui-sans-serif, system-ui, sans-serif";
+      ctx.fillText(sub, 256, 560);
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 14;
+      ctx.strokeRect(7, 7, 498, 754);
       const t = new THREE.CanvasTexture(c);
       t.colorSpace = THREE.SRGBColorSpace;
       return t;
@@ -452,8 +494,8 @@ export function OfficeScene() {
     };
 
     // ── Lighting ─────────────────────────────────────────────────────────────
-    scene.add(new THREE.AmbientLight(0x223044, 0.55));
-    scene.add(new THREE.HemisphereLight(0x334466, 0x110a18, 0.5));
+    scene.add(new THREE.AmbientLight(0x4e608a, 1.45));
+    scene.add(new THREE.HemisphereLight(0x728ab8, 0x2a2238, 1.2));
 
     const panelPositions = [
       new THREE.Vector3(-halfW * 0.45, ROOM_H - 0.2, gridD * 0.25),
@@ -462,7 +504,7 @@ export function OfficeScene() {
       new THREE.Vector3(halfW * 0.45, ROOM_H - 0.2, gridD * 0.75),
     ];
     panelPositions.forEach((p, i) => {
-      const sp = new THREE.SpotLight(0xbfd4ff, 2.2, 26, Math.PI / 3.2, 0.5, 1.2);
+      const sp = new THREE.SpotLight(0xcfe0ff, 2.9, 28, Math.PI / 3.2, 0.5, 1.2);
       sp.position.copy(p);
       sp.target.position.set(p.x, 0, p.z);
       sp.castShadow = i < 2;
@@ -486,8 +528,10 @@ export function OfficeScene() {
     );
     const wallMat = track(
       new THREE.MeshStandardMaterial({
-        color: 0x171b2a,
-        roughness: 0.9,
+        color: 0x3c4666,
+        emissive: 0x14182a,
+        emissiveIntensity: 0.5,
+        roughness: 0.85,
         metalness: 0.05,
         side: THREE.BackSide,
       }),
@@ -505,7 +549,9 @@ export function OfficeScene() {
     );
     const ceilMat = track(
       new THREE.MeshStandardMaterial({
-        color: 0x0c0e18,
+        color: 0x222842,
+        emissive: 0x0e1120,
+        emissiveIntensity: 0.4,
         roughness: 0.95,
         side: THREE.BackSide,
       }),
@@ -596,6 +642,84 @@ export function OfficeScene() {
       panelBlooms.push(b);
     });
 
+    // ── Fluorescent ceiling tubes (shootable, some flicker) ──────────────────
+    interface Fluoro {
+      group: THREE.Group;
+      tubeMat: THREE.MeshBasicMaterial;
+      light: THREE.PointLight;
+      bloom: THREE.Sprite;
+      broken: boolean;
+      alive: boolean;
+      seed: number;
+      baseI: number;
+    }
+    const fluoros: Fluoro[] = [];
+    const fluoroTargets: THREE.Mesh[] = [];
+    const fixtureMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0xc8ccd4,
+        roughness: 0.5,
+        metalness: 0.6,
+      }),
+    );
+    const fluoroHitMat = track(new THREE.MeshBasicMaterial({ visible: false }));
+    const housingGeo = new THREE.BoxGeometry(2.7, 0.13, 0.66);
+    const tubeGeo = new THREE.BoxGeometry(2.4, 0.07, 0.13);
+    const fluoroHitGeo = new THREE.BoxGeometry(2.9, 0.5, 0.85);
+    const fluoroSpots: { x: number; z: number; broken?: boolean }[] = [
+      { x: -5.8, z: 0 },
+      { x: 5.8, z: 0 },
+      { x: -5.8, z: gridD * 0.34, broken: true },
+      { x: 5.8, z: gridD * 0.34 },
+      { x: -5.8, z: gridD * 0.67 },
+      { x: 5.8, z: gridD * 0.67, broken: true },
+      { x: -5.8, z: gridD },
+      { x: 5.8, z: gridD },
+    ];
+    const fluoroY = ROOM_H - 0.09;
+    fluoroSpots.forEach((sp, idx) => {
+      const g = new THREE.Group();
+      g.position.set(sp.x, fluoroY, sp.z);
+
+      const housing = new THREE.Mesh(housingGeo, fixtureMat);
+      g.add(housing);
+
+      const tubeMat = track(
+        new THREE.MeshBasicMaterial({ color: 0xeaf2ff, toneMapped: false }),
+      );
+      for (const tz of [-0.16, 0.16]) {
+        const tube = new THREE.Mesh(tubeGeo, tubeMat);
+        tube.position.set(0, -0.06, tz);
+        g.add(tube);
+      }
+
+      const light = new THREE.PointLight(0xdfeaff, 2.7, 16, 1.5);
+      light.position.set(0, -0.35, 0);
+      g.add(light);
+
+      const bloom = makeBloom(0xdfeaff, 3.4, 0.5);
+      bloom.position.set(0, -0.4, 0);
+      g.add(bloom);
+
+      const hit = new THREE.Mesh(fluoroHitGeo, fluoroHitMat);
+      hit.position.set(0, -0.18, 0);
+      hit.userData = { fluoro: idx };
+      g.add(hit);
+
+      scene.add(g);
+      fluoros.push({
+        group: g,
+        tubeMat,
+        light,
+        bloom,
+        broken: !!sp.broken,
+        alive: true,
+        seed: Math.random() * 100,
+        baseI: 2.7,
+      });
+      fluoroTargets.push(hit);
+    });
+
     const wbMat = track(
       new THREE.MeshStandardMaterial({ map: wbTex, roughness: 0.5 }),
     );
@@ -611,8 +735,12 @@ export function OfficeScene() {
     const plantSpots: THREE.Vector3[] = [
       new THREE.Vector3(-halfW + 1, 0, minZ + 1.2),
       new THREE.Vector3(halfW - 1, 0, minZ + 1.2),
+      new THREE.Vector3(-halfW + 1, 0, gridD * 0.28),
+      new THREE.Vector3(halfW - 1, 0, gridD * 0.28),
       new THREE.Vector3(-halfW + 1, 0, gridD * 0.5),
       new THREE.Vector3(halfW - 1, 0, gridD * 0.5),
+      new THREE.Vector3(-halfW + 1, 0, gridD * 0.75),
+      new THREE.Vector3(halfW - 1, 0, gridD * 0.75),
       new THREE.Vector3(-halfW + 1, 0, maxZ - 2),
       new THREE.Vector3(halfW - 1, 0, maxZ - 2),
     ];
@@ -715,6 +843,202 @@ export function OfficeScene() {
     }
     partInst.instanceMatrix.needsUpdate = true;
     scene.add(partInst);
+
+    // ── Decor: filing cabinets, water cooler, wall clock ─────────────────────
+    const decor = new THREE.Group();
+
+    // Filing cabinets lined along the side walls
+    const cabBodyGeo = new THREE.BoxGeometry(0.8, 1.3, 0.6);
+    const cabBodyMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x6b7280,
+        roughness: 0.5,
+        metalness: 0.5,
+      }),
+    );
+    const drawerGeo = new THREE.BoxGeometry(0.7, 0.34, 0.04);
+    const drawerMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x515a66,
+        roughness: 0.5,
+        metalness: 0.55,
+      }),
+    );
+    const handleGeo = new THREE.BoxGeometry(0.22, 0.04, 0.03);
+    const cabSpots: [number, number][] = [
+      [-halfW + 0.6, minZ + 3.2],
+      [-halfW + 0.6, minZ + 4.2],
+      [halfW - 0.6, minZ + 3.2],
+      [halfW - 0.6, minZ + 4.2],
+    ];
+    cabSpots.forEach(([x, z]) => {
+      const cab = new THREE.Mesh(cabBodyGeo, cabBodyMat);
+      cab.position.set(x, 0.65, z);
+      cab.castShadow = true;
+      decor.add(cab);
+      const faceX = x < 0 ? 0.31 : -0.31;
+      for (let d = 0; d < 3; d++) {
+        const drawer = new THREE.Mesh(drawerGeo, drawerMat);
+        drawer.position.set(x + faceX, 0.32 + d * 0.4, z);
+        drawer.rotation.y = Math.PI / 2;
+        decor.add(drawer);
+        const handle = new THREE.Mesh(handleGeo, metalMat);
+        handle.position.set(x + faceX + (x < 0 ? 0.02 : -0.02), 0.32 + d * 0.4, z);
+        handle.rotation.y = Math.PI / 2;
+        decor.add(handle);
+      }
+    });
+
+    // Water cooler near the entrance
+    const coolerBase = new THREE.Mesh(
+      new THREE.BoxGeometry(0.45, 1.0, 0.45),
+      track(
+        new THREE.MeshStandardMaterial({
+          color: 0xe8edf2,
+          roughness: 0.4,
+          metalness: 0.1,
+        }),
+      ),
+    );
+    coolerBase.position.set(halfW - 0.7, 0.5, minZ + 1.4);
+    coolerBase.castShadow = true;
+    decor.add(coolerBase);
+    const bottle = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.22, 0.18, 0.55, 14),
+      track(
+        new THREE.MeshStandardMaterial({
+          color: 0x4aa8e0,
+          roughness: 0.1,
+          metalness: 0.0,
+          transparent: true,
+          opacity: 0.55,
+        }),
+      ),
+    );
+    bottle.position.set(halfW - 0.7, 1.28, minZ + 1.4);
+    decor.add(bottle);
+
+    // Wall clock on the back wall
+    const clockBody = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.42, 0.42, 0.07, 28),
+      track(
+        new THREE.MeshStandardMaterial({ color: 0xf4f6fa, roughness: 0.4 }),
+      ),
+    );
+    clockBody.rotation.x = Math.PI / 2;
+    clockBody.position.set(-halfW * 0.5, ROOM_H - 1.1, maxZ - 0.2);
+    decor.add(clockBody);
+    const clockGroup = new THREE.Group();
+    clockGroup.position.copy(clockBody.position);
+    clockGroup.position.z -= 0.05;
+    const handMat = track(new THREE.MeshBasicMaterial({ color: 0x111418 }));
+    const hourHand = new THREE.Mesh(
+      new THREE.BoxGeometry(0.04, 0.22, 0.01),
+      handMat,
+    );
+    hourHand.position.y = 0.09;
+    const minHand = new THREE.Mesh(
+      new THREE.BoxGeometry(0.03, 0.32, 0.01),
+      handMat,
+    );
+    minHand.position.y = 0.14;
+    const hourPivot = new THREE.Group();
+    hourPivot.add(hourHand);
+    hourPivot.rotation.z = -1.2;
+    const minPivot = new THREE.Group();
+    minPivot.add(minHand);
+    minPivot.rotation.z = 2.4;
+    clockGroup.add(hourPivot, minPivot);
+    decor.add(clockGroup);
+
+    // Ceiling air ducts running the length of the room
+    const ductMat = track(
+      new THREE.MeshStandardMaterial({
+        color: 0x3b414d,
+        roughness: 0.6,
+        metalness: 0.5,
+      }),
+    );
+    [-halfW * 0.7, halfW * 0.7].forEach((dx) => {
+      const duct = new THREE.Mesh(
+        new THREE.BoxGeometry(0.5, 0.5, dimZ - 2),
+        ductMat,
+      );
+      duct.position.set(dx, ROOM_H - 0.4, cz);
+      decor.add(duct);
+    });
+
+    // Framed motivational posters on the side walls
+    const posterGeo = new THREE.PlaneGeometry(1.15, 1.72);
+    const frameGeo = new THREE.BoxGeometry(1.3, 1.88, 0.06);
+    const frameMat = track(
+      new THREE.MeshStandardMaterial({ color: 0x14161f, roughness: 0.6 }),
+    );
+    const posterDefs: {
+      side: number;
+      z: number;
+      bg: string;
+      accent: string;
+      title: string;
+      sub: string;
+    }[] = [
+      {
+        side: -1,
+        z: gridD * 0.18,
+        bg: "#0f2a22",
+        accent: "#34d399",
+        title: "{ }",
+        sub: "SHIP IT",
+      },
+      {
+        side: -1,
+        z: gridD * 0.62,
+        bg: "#1a1230",
+        accent: "#c084fc",
+        title: "λ",
+        sub: "REFACTOR",
+      },
+      {
+        side: 1,
+        z: gridD * 0.18,
+        bg: "#0e2436",
+        accent: "#22d3ee",
+        title: "</>",
+        sub: "DEPLOY",
+      },
+      {
+        side: 1,
+        z: gridD * 0.62,
+        bg: "#2e1b10",
+        accent: "#fbbf24",
+        title: "0",
+        sub: "BUGS",
+      },
+    ];
+    posterDefs.forEach((d) => {
+      const tex = track(posterTexture(d.bg, d.accent, d.title, d.sub));
+      const pMat = track(
+        new THREE.MeshStandardMaterial({
+          map: tex,
+          emissiveMap: tex,
+          emissive: 0xffffff,
+          emissiveIntensity: 0.35,
+          roughness: 0.6,
+        }),
+      );
+      const x = d.side * (halfW - 0.08);
+      const rotY = d.side > 0 ? -Math.PI / 2 : Math.PI / 2;
+      const frame = new THREE.Mesh(frameGeo, frameMat);
+      frame.position.set(d.side * (halfW - 0.03), 2.25, d.z);
+      frame.rotation.y = rotY;
+      decor.add(frame);
+      const poster = new THREE.Mesh(posterGeo, pMat);
+      poster.position.set(x, 2.25, d.z);
+      poster.rotation.y = rotY;
+      decor.add(poster);
+    });
+
+    scene.add(decor);
 
     // ── Shared geometries for rigs ───────────────────────────────────────────
     const deskTopGeo = new THREE.BoxGeometry(2.6, 0.1, 1.3);
@@ -1378,6 +1702,25 @@ export function OfficeScene() {
       pushHud({ reloading: true });
     };
 
+    const sfxGlass = () => {
+      beep(2600, 0.05, "square", 0.12, 1300);
+      beep(3400, 0.04, "triangle", 0.1, 1700);
+      window.setTimeout(() => beep(1500, 0.05, "square", 0.08, 700), 40);
+    };
+    const breakFluoro = (idx: number, point: THREE.Vector3) => {
+      const f = fluoros[idx];
+      if (!f || !f.alive) return;
+      f.alive = false;
+      f.light.intensity = 0;
+      f.tubeMat.color.setHex(0x191b22);
+      (f.bloom.material as THREE.SpriteMaterial).opacity = 0;
+      burst(point, 0xcfe6ff, "spark", 16, 5, 0.22);
+      burst(point, 0xffffff, "poof", 4, 1.5, 0.55);
+      popImpact(point, 0xbcd4ff, 4);
+      sfxGlass();
+      combat.shake = Math.max(combat.shake, 0.28);
+    };
+
     const shoot = () => {
       const now = performance.now();
       if (combat.reloading) return;
@@ -1419,6 +1762,9 @@ export function OfficeScene() {
           targets.push(r.head, r.body);
         }
       });
+      fluoros.forEach((f, i) => {
+        if (f.alive) targets.push(fluoroTargets[i]);
+      });
       const hits = raycaster.intersectObjects(targets, false);
       const muzzleWorld = gun.localToWorld(new THREE.Vector3(0, 0.04, -0.7));
       let endPoint = scratchV
@@ -1427,6 +1773,11 @@ export function OfficeScene() {
       if (hits.length) {
         const hit = hits[0];
         endPoint = hit.point.clone();
+        if (hit.object.userData.fluoro !== undefined) {
+          breakFluoro(hit.object.userData.fluoro as number, endPoint);
+          fireTracer(muzzleWorld, endPoint);
+          return;
+        }
         const paneId = hit.object.userData.paneId as string;
         const part = hit.object.userData.part as string;
         let rig: Rig | undefined;
@@ -1868,6 +2219,30 @@ export function OfficeScene() {
         true;
 
       const t = now / 1000;
+
+      for (const f of fluoros) {
+        if (!f.alive) continue;
+        const bm = f.bloom.material as THREE.SpriteMaterial;
+        if (f.broken) {
+          const wave =
+            Math.sin(t * 31 + f.seed) * Math.sin(t * 12.7 + f.seed * 2.3);
+          let on = wave > -0.35 ? 1 : 0;
+          if (Math.random() < 0.07) on = Math.random() < 0.5 ? 0 : 1;
+          const lvl = on ? 0.65 + Math.random() * 0.55 : 0.03;
+          f.light.intensity = f.baseI * lvl;
+          f.tubeMat.color.setRGB(
+            0.72 * lvl + 0.08,
+            0.79 * lvl + 0.08,
+            0.92 * lvl + 0.1,
+          );
+          bm.opacity = 0.5 * lvl;
+        } else {
+          const hum = 0.96 + 0.04 * Math.sin(t * 58 + f.seed);
+          f.light.intensity = f.baseI * hum;
+          bm.opacity = 0.5 * hum;
+        }
+      }
+
       rigs.forEach((r) => {
         r.light.color.lerp(r.targetColor, 0.1);
         r.light.intensity += (r.targetIntensity - r.light.intensity) * 0.1;
